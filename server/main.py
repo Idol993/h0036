@@ -44,7 +44,7 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 async_engine = create_async_engine(DATABASE_URL, echo=False)
 async_session = async_sessionmaker(async_engine, class_=AsyncSession, expire_on_commit=False)
-sync_engine = create_engine(SYNC_DB_URL, echo=False)
+sync_engine = create_engine(SYNC_DB_URL, echo=False, pool_pre_ping=True)
 SyncSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=sync_engine)
 
 
@@ -59,6 +59,7 @@ class PileStatus(str, PyEnum):
     CHARGING = "charging"
     FAULT = "fault"
     OFFLINE = "offline"
+    ONLINE = "online"
 
 
 class PileType(str, PyEnum):
@@ -84,7 +85,7 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     phone = Column(String(20), unique=True, index=True, nullable=False)
     password_hash = Column(String(255), default="")
-    role = Column(Enum(UserRole), default=UserRole.OWNER)
+    role = Column(Enum(UserRole, values_callable=lambda x: [e.value for e in x]), default=UserRole.OWNER)
     token = Column(String(64), unique=True, index=True, default="")
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -107,9 +108,9 @@ class Pile(Base):
     id = Column(Integer, primary_key=True, index=True)
     station_id = Column(Integer, ForeignKey("stations.id"), nullable=False)
     pile_code = Column(String(50), unique=True, index=True, nullable=False)
-    pile_type = Column(Enum(PileType), default=PileType.SLOW)
+    pile_type = Column(Enum(PileType, values_callable=lambda x: [e.value for e in x]), default=PileType.SLOW)
     power = Column(Float, default=7.0)
-    status = Column(Enum(PileStatus), default=PileStatus.OFFLINE)
+    status = Column(Enum(PileStatus, values_callable=lambda x: [e.value for e in x]), default=PileStatus.OFFLINE)
     fault_code = Column(String(50), default="")
     last_heartbeat = Column(DateTime, default=datetime.utcnow)
     station = relationship("Station", back_populates="piles")
@@ -128,7 +129,7 @@ class Order(Base):
     energy_fee = Column(Float, default=0.0)
     service_fee = Column(Float, default=0.0)
     total_fee = Column(Float, default=0.0)
-    payment_status = Column(Enum(PaymentStatus), default=PaymentStatus.PENDING)
+    payment_status = Column(Enum(PaymentStatus, values_callable=lambda x: [e.value for e in x]), default=PaymentStatus.PENDING)
     paid_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -151,7 +152,7 @@ class WorkOrder(Base):
     station_id = Column(Integer, ForeignKey("stations.id"), nullable=False)
     fault_code = Column(String(100), default="")
     fault_description = Column(Text, default="")
-    status = Column(Enum(WorkOrderStatus), default=WorkOrderStatus.PENDING)
+    status = Column(Enum(WorkOrderStatus, values_callable=lambda x: [e.value for e in x]), default=WorkOrderStatus.PENDING)
     handler_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     handler_name = Column(String(50), default="")
     result = Column(Text, default="")
@@ -202,6 +203,7 @@ billing_engine = BillingEngine()
 pending_commands: Dict[str, asyncio.Event] = {}
 command_results: Dict[str, Dict] = {}
 ws_clients: List[WebSocket] = []
+fault_pile_ids: set = set()
 
 
 async def get_db():
@@ -422,11 +424,14 @@ async def update_pile_status(pile_code: str, payload: Dict):
         if pile:
             old_status = pile.status
             new_status = PileStatus(payload.get("status", pile.status.value))
+            if old_status == PileStatus.FAULT:
+                fault_pile_ids.add(pile.id)
             pile.status = new_status
             pile.fault_code = payload.get("fault_code", "")
             pile.last_heartbeat = datetime.utcnow()
             await db.commit()
-            if old_status == PileStatus.FAULT and new_status in (PileStatus.ONLINE, PileStatus.IDLE, PileStatus.CHARGING):
+            if new_status in (PileStatus.ONLINE, PileStatus.IDLE, PileStatus.CHARGING) and pile.id in fault_pile_ids:
+                fault_pile_ids.discard(pile.id)
                 wo_result = await db.execute(
                     select(WorkOrder).where(
                         WorkOrder.pile_id == pile.id,
@@ -436,7 +441,7 @@ async def update_pile_status(pile_code: str, payload: Dict):
                 pending_wos = wo_result.scalars().all()
                 for wo in pending_wos:
                     wo.status = WorkOrderStatus.RESOLVED
-                    wo.result = "远程重启后设备恢复正常，自动关闭工单"
+                    wo.result = "设备恢复在线，自动关闭工单"
                     wo.resolved_at = datetime.utcnow()
                 if pending_wos:
                     await db.commit()
@@ -821,6 +826,7 @@ async def list_orders(
     station_id: Optional[int] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    exclude_cancelled: Optional[bool] = None,
     db: AsyncSession = Depends(get_db),
     user: Optional[User] = Depends(get_current_user)
 ):
@@ -835,14 +841,16 @@ async def list_orders(
         conditions.append(Order.user_phone == phone)
     if start_date:
         try:
-            conditions.append(Order.created_at >= datetime.fromisoformat(start_date))
+            conditions.append(Order.start_time >= datetime.fromisoformat(start_date))
         except ValueError:
             pass
     if end_date:
         try:
-            conditions.append(Order.created_at <= datetime.fromisoformat(end_date))
+            conditions.append(Order.start_time <= datetime.fromisoformat(end_date))
         except ValueError:
             pass
+    if exclude_cancelled:
+        conditions.append(Order.payment_status != PaymentStatus.CANCELLED)
     if conditions:
         query = query.where(and_(*conditions))
     result = await db.execute(query)
@@ -1006,6 +1014,8 @@ async def pile_command(
             raise HTTPException(403, "无权操作该充电桩")
     asyncio.create_task(send_pile_command_fire_and_forget(req.pile_code, req.command))
     if req.command == "reboot":
+        if pile.status == PileStatus.FAULT:
+            fault_pile_ids.add(pile.id)
         pile.status = PileStatus.OFFLINE
         await db.commit()
         await status_cache.set(req.pile_code, {
@@ -1191,7 +1201,13 @@ def list_work_orders(
     if station_id:
         query = query.filter(WorkOrder.station_id == station_id)
     if status:
-        query = query.filter(WorkOrder.status == status)
+        status_enum = None
+        try:
+            status_enum = WorkOrderStatus(status)
+        except ValueError:
+            pass
+        if status_enum:
+            query = query.filter(WorkOrder.status == status_enum)
     wos = query.all()
     pile_ids = [w.pile_id for w in wos]
     piles = {p.id: p for p in db.query(Pile).filter(Pile.id.in_(pile_ids)).all()} if pile_ids else {}

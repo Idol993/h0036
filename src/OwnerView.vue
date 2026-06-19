@@ -237,12 +237,20 @@
             <div class="max-w-xs mx-auto">
               <div class="flex gap-2">
                 <input v-model="manualPileCode" placeholder="或手动输入桩编号如 P0002"
-                       class="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-green-500 focus:border-green-500 outline-none"/>
-                <button @click="scanStart" class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition">
-                  启动
+                       :disabled="currentUser && currentUser.role !== 'owner'"
+                       class="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-green-500 focus:border-green-500 outline-none disabled:bg-gray-100 disabled:text-gray-400"
+                       />
+                <button @click="scanStart"
+                        :disabled="currentUser && currentUser.role !== 'owner'"
+                        class="px-4 py-2 rounded-lg text-sm font-medium transition"
+                        :class="currentUser && currentUser.role !== 'owner'
+                          ? 'bg-gray-200 text-gray-400 cursor-not-allowed'
+                          : 'bg-green-600 hover:bg-green-700 text-white'">
+                  {{ currentUser && currentUser.role !== 'owner' ? '无权限' : '启动' }}
                 </button>
               </div>
-              <p class="text-xs text-gray-400 mt-2">提示：可直接在地图上点击充电桩的"扫码充电"</p>
+              <p v-if="currentUser && currentUser.role !== 'owner'" class="text-xs text-red-500 mt-2">仅车主账号可发起充电</p>
+              <p v-else class="text-xs text-gray-400 mt-2">提示：可直接在地图上点击充电桩的"扫码充电"</p>
             </div>
           </div>
         </div>
@@ -539,6 +547,10 @@ const scanStart = async () => {
   if (!manualPileCode.value) return
   if (!currentUser.value) {
     showLogin.value = true
+    return
+  }
+  if (currentUser.value.role !== 'owner') {
+    showToast('仅车主账号可发起充电，请切换车主账号登录')
     return
   }
   try {

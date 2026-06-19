@@ -792,6 +792,7 @@ const revenueDetailOrders = ref<any[]>([])
 
 let chart: any = null
 let ws: WebSocket | null = null
+let refreshTimer: ReturnType<typeof setInterval> | null = null
 
 const periodLabel = computed(() => periods.find(p => p.key === dashboardPeriod.value)?.label || '今日')
 
@@ -1020,6 +1021,7 @@ const submitCreateWo = async () => {
     showCreateWo.value = false
     createWoForm.value = { pile_code: '', fault_code: '', fault_description: '' }
     await loadWorkOrders()
+    await loadDashboard()
     showToast('工单创建成功')
   } catch (e: any) {
     showToast(e.response?.data?.detail || '创建失败')
@@ -1078,7 +1080,7 @@ const openRevenueDetail = async (item: any) => {
   if (!item.station_id) return
   revenueDetailStation.value = item
   try {
-    const params: any = { station_id: item.station_id }
+    const params: any = { station_id: item.station_id, exclude_cancelled: true }
     if (revenuePeriod.value === 'custom') {
       if (revenueDateRange.value.start) params.start_date = revenueDateRange.value.start + 'T00:00:00'
       if (revenueDateRange.value.end) params.end_date = revenueDateRange.value.end + 'T23:59:59'
@@ -1126,10 +1128,15 @@ const connectWS = () => {
         if (st) {
           const pile = st.piles.find((p: any) => p.pile_code === data.pile_code)
           if (pile) {
+            const oldStatus = pile.status
             pile.status = data.status
             pile.fault_code = data.fault_code || ''
             st.available = st.piles.filter((p: any) => p.status === 'idle').length
             st.fault = st.piles.filter((p: any) => p.status === 'fault').length
+            if (oldStatus !== 'idle' && (data.status === 'idle' || data.status === 'charging')) {
+              loadDashboard()
+              if (activeTab.value === 'fault') loadWorkOrders()
+            }
           }
         }
         if (selectedStation.value && selectedStation.value.id === data.station_id) {
@@ -1157,11 +1164,16 @@ onMounted(() => {
   loadBillingRules()
   connectWS()
   window.addEventListener('resize', renderTrendChart)
+  refreshTimer = setInterval(() => {
+    loadDashboard()
+    if (activeTab.value === 'fault') loadWorkOrders()
+  }, 30000)
 })
 
 onUnmounted(() => {
   if (ws) ws.close()
   if (chart) chart.dispose()
+  if (refreshTimer) clearInterval(refreshTimer)
   window.removeEventListener('resize', renderTrendChart)
 })
 </script>
