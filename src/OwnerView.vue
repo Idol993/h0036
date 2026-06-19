@@ -94,8 +94,11 @@
               </div>
               <button v-if="pile.status === 'idle'"
                       @click="startCharging(pile)"
-                      class="bg-green-600 hover:bg-green-700 text-white text-sm px-4 py-1.5 rounded-lg font-medium transition">
-                扫码充电
+                      :disabled="currentUser && currentUser.role !== 'owner'"
+                      :class="currentUser && currentUser.role !== 'owner'
+                        ? 'bg-gray-200 text-gray-400 cursor-not-allowed text-sm px-4 py-1.5 rounded-lg font-medium'
+                        : 'bg-green-600 hover:bg-green-700 text-white text-sm px-4 py-1.5 rounded-lg font-medium transition'">
+                {{ currentUser && currentUser.role !== 'owner' ? '无权限' : '扫码充电' }}
               </button>
               <button v-else-if="pile.status === 'charging' && currentOrder && currentOrder.pile_code === pile.pile_code"
                       @click="stopCharging()"
@@ -460,6 +463,10 @@ const startCharging = async (pile: Pile) => {
   if (!currentUser.value) {
     showLogin.value = true
     showToast('请先登录')
+    return
+  }
+  if (currentUser.value.role !== 'owner') {
+    showToast('仅车主账号可发起充电，请切换车主账号登录')
     return
   }
   try {

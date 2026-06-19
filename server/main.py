@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import sys
 import time
 import secrets
 import io
@@ -8,6 +9,12 @@ import csv
 from datetime import datetime, timedelta, date
 from enum import Enum as PyEnum
 from typing import Optional, List, Dict, Any, Tuple
+
+if sys.platform == 'win32':
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
 
 import aiomqtt
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query, BackgroundTasks, Header
@@ -63,6 +70,13 @@ class PaymentStatus(str, PyEnum):
     PENDING = "pending"
     PAID = "paid"
     CANCELLED = "cancelled"
+
+
+class WorkOrderStatus(str, PyEnum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    RESOLVED = "resolved"
+    CLOSED = "closed"
 
 
 class User(Base):
@@ -127,6 +141,23 @@ class BillingRule(Base):
     end_hour = Column(Integer, nullable=False)
     price_per_kwh = Column(Float, nullable=False)
     is_active = Column(Boolean, default=True)
+
+
+class WorkOrder(Base):
+    __tablename__ = "work_orders"
+    id = Column(Integer, primary_key=True, index=True)
+    order_no = Column(String(50), unique=True, index=True)
+    pile_id = Column(Integer, ForeignKey("piles.id"), nullable=False)
+    station_id = Column(Integer, ForeignKey("stations.id"), nullable=False)
+    fault_code = Column(String(100), default="")
+    fault_description = Column(Text, default="")
+    status = Column(Enum(WorkOrderStatus), default=WorkOrderStatus.PENDING)
+    handler_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    handler_name = Column(String(50), default="")
+    result = Column(Text, default="")
+    resolved_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class PileStatusCache:
@@ -256,6 +287,17 @@ class LoginRequest(BaseModel):
     password: str = ""
 
 
+class CreateWorkOrderRequest(BaseModel):
+    pile_code: str
+    fault_code: str = ""
+    fault_description: str = ""
+
+
+class HandleWorkOrderRequest(BaseModel):
+    result: str = ""
+    status: WorkOrderStatus = WorkOrderStatus.RESOLVED
+
+
 app = FastAPI(title="充电桩实时监控与扫码启停平台", version="1.1.0")
 
 app.add_middleware(
@@ -318,19 +360,30 @@ async def startup_event():
                 db.commit()
     finally:
         db.close()
-    asyncio.create_task(mqtt_subscribe_loop())
+    asyncio.create_task(_safe_mqtt_subscribe())
     asyncio.create_task(offline_monitor_loop())
     asyncio.create_task(payment_timeout_loop())
 
 
+async def _safe_mqtt_subscribe():
+    import asyncio as _asyncio
+    try:
+        await mqtt_subscribe_loop()
+    except Exception as e:
+        print(f"[MQTT] Fatal error, MQTT disabled: {e}")
+
+
 async def mqtt_subscribe_loop():
-    while True:
+    retry_count = 0
+    max_retries = 10
+    while retry_count < max_retries:
         try:
             async with aiomqtt.Client(MQTT_BROKER, port=MQTT_PORT) as client:
                 await client.subscribe("station/+/pile/+/status")
                 await client.subscribe("pile/+/cmd/ack")
                 await client.subscribe("pile/+/charging/report")
                 print(f"[MQTT] Connected to {MQTT_BROKER}:{MQTT_PORT}")
+                retry_count = 0
                 async for message in client.messages:
                     try:
                         topic = str(message.topic)
@@ -339,8 +392,10 @@ async def mqtt_subscribe_loop():
                     except Exception as e:
                         print(f"[MQTT] Message error: {e}")
         except Exception as e:
-            print(f"[MQTT] Connection error, reconnect in 5s: {e}")
+            retry_count += 1
+            print(f"[MQTT] Connection error (attempt {retry_count}/{max_retries}), reconnect in 5s: {e}")
             await asyncio.sleep(5)
+    print("[MQTT] Max retries reached, MQTT subscription stopped")
 
 
 async def handle_mqtt_message(topic: str, payload: Dict):
@@ -365,11 +420,26 @@ async def update_pile_status(pile_code: str, payload: Dict):
         result = await db.execute(select(Pile).where(Pile.pile_code == pile_code))
         pile = result.scalar_one_or_none()
         if pile:
+            old_status = pile.status
             new_status = PileStatus(payload.get("status", pile.status.value))
             pile.status = new_status
             pile.fault_code = payload.get("fault_code", "")
             pile.last_heartbeat = datetime.utcnow()
             await db.commit()
+            if old_status == PileStatus.FAULT and new_status in (PileStatus.ONLINE, PileStatus.IDLE, PileStatus.CHARGING):
+                wo_result = await db.execute(
+                    select(WorkOrder).where(
+                        WorkOrder.pile_id == pile.id,
+                        WorkOrder.status.in_([WorkOrderStatus.PENDING, WorkOrderStatus.PROCESSING])
+                    ).order_by(WorkOrder.id.desc())
+                )
+                pending_wos = wo_result.scalars().all()
+                for wo in pending_wos:
+                    wo.status = WorkOrderStatus.RESOLVED
+                    wo.result = "远程重启后设备恢复正常，自动关闭工单"
+                    wo.resolved_at = datetime.utcnow()
+                if pending_wos:
+                    await db.commit()
             await status_cache.set(pile_code, {
                 "id": pile.id,
                 "station_id": pile.station_id,
@@ -598,6 +668,8 @@ async def start_charging(
     from sqlalchemy import select
     if not user:
         raise HTTPException(401, "请先登录")
+    if user.role != UserRole.OWNER:
+        raise HTTPException(403, "仅车主角色可发起充电")
     if user.phone != req.phone:
         raise HTTPException(400, "只能使用自己的账号启动充电")
     result = await db.execute(select(Pile).where(Pile.pile_code == req.pile_code))
@@ -612,8 +684,9 @@ async def start_charging(
         raise HTTPException(400, "该充电桩离线，无法使用")
     asyncio.create_task(send_pile_command_fire_and_forget(req.pile_code, "start", phone=req.phone))
     pile.status = PileStatus.CHARGING
-    order_no = f"OD{datetime.utcnow().strftime('%Y%m%d%H%M%S')}{pile.id:04d}"
-    start_time = datetime.utcnow()
+    now_ts = datetime.utcnow()
+    order_no = f"OD{now_ts.strftime('%Y%m%d%H%M%S')}{now_ts.microsecond // 1000:03d}{pile.id:04d}"
+    start_time = now_ts
     order = Order(
         order_no=order_no, user_phone=req.phone, user_id=user.id,
         pile_id=pile.id, start_time=start_time,
@@ -845,12 +918,9 @@ async def export_orders(
             piles[p.id] = p
             if p.station_id not in stations_map:
                 stations_map[p.station_id] = await db.get(Station, p.station_id)
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["订单号", "手机号", "站点名称", "桩编号", "桩类型",
-                     "开始时间", "结束时间", "电量(度)", "电费", "服务费", "总费用", "支付状态"])
     status_text = {"paid": "已支付", "pending": "待支付", "cancelled": "已取消"}
     type_text = {"fast": "快充", "slow": "慢充"}
+    rows = []
     for o in orders:
         p = piles.get(o.pile_id)
         st = stations_map.get(p.station_id) if p else None
@@ -858,7 +928,7 @@ async def export_orders(
             continue
         if user.role == UserRole.OPERATOR and (not st or st.operator_id != user.id):
             continue
-        writer.writerow([
+        rows.append([
             o.order_no,
             o.user_phone,
             st.name if st else "",
@@ -872,6 +942,15 @@ async def export_orders(
             round(o.total_fee, 2),
             status_text.get(o.payment_status.value, o.payment_status.value),
         ])
+    if len(rows) == 0:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"success": True, "data": [], "empty": True, "message": "该条件下没有可导出的订单"})
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["订单号", "手机号", "站点名称", "桩编号", "桩类型",
+                     "开始时间", "结束时间", "电量(度)", "电费", "服务费", "总费用", "支付状态"])
+    for row in rows:
+        writer.writerow(row)
     output.seek(0)
     csv_content = "\ufeff" + output.getvalue()
     filename = f"orders_{station_id or 'all'}_{datetime.now().strftime('%Y%m%d%H%M')}.csv"
@@ -943,9 +1022,13 @@ async def pile_command(
     return {"success": True, "data": {"result": "sent"}}
 
 
-def _get_time_range(period: str) -> Tuple[datetime, datetime]:
+def _get_time_range(period: str, start_date: Optional[str] = None, end_date: Optional[str] = None) -> Tuple[datetime, datetime]:
     now = datetime.utcnow()
     today_start = datetime.combine(now.date(), datetime.min.time())
+    if period == "custom":
+        s = datetime.fromisoformat(start_date) if start_date else today_start
+        e = datetime.fromisoformat(end_date) if end_date else now
+        return s, e
     if period == "week":
         week_start = today_start - timedelta(days=now.weekday())
         return week_start, now
@@ -1030,6 +1113,13 @@ def admin_dashboard(
     total_energy = sum(o.energy_kwh for o in orders_range)
     total_revenue = sum(o.total_fee for o in orders_range if o.payment_status == PaymentStatus.PAID)
 
+    wo_query = db.query(WorkOrder)
+    if user.role == UserRole.OPERATOR:
+        wo_query = wo_query.filter(WorkOrder.station_id.in_(accessible_station_ids)) if accessible_station_ids else wo_query.filter(WorkOrder.station_id == -1)
+    pending_wo = wo_query.filter(WorkOrder.status == WorkOrderStatus.PENDING).count()
+    processing_wo = wo_query.filter(WorkOrder.status == WorkOrderStatus.PROCESSING).count()
+    resolved_wo = wo_query.filter(WorkOrder.status == WorkOrderStatus.RESOLVED).count()
+
     return {"success": True, "data": {
         "period": period,
         "total_piles": total_piles,
@@ -1047,6 +1137,11 @@ def admin_dashboard(
         "period_revenue": round(total_revenue, 2),
         "range_start": range_start.isoformat(),
         "range_end": range_end.isoformat(),
+        "work_order_stats": {
+            "pending": pending_wo,
+            "processing": processing_wo,
+            "resolved": resolved_wo,
+        },
     }}
 
 
@@ -1078,6 +1173,206 @@ def create_billing_rule(
     db.commit()
     db.refresh(new_rule)
     return {"success": True, "data": {"id": new_rule.id}}
+
+
+@app.get("/api/work-orders")
+def list_work_orders(
+    station_id: Optional[int] = None,
+    status: Optional[str] = None,
+    db: Session = Depends(get_sync_db),
+    user: Optional[User] = Depends(get_current_user)
+):
+    if not user or user.role not in (UserRole.ADMIN, UserRole.OPERATOR):
+        raise HTTPException(403, "无权查看工单")
+    query = db.query(WorkOrder).order_by(WorkOrder.id.desc())
+    if user.role == UserRole.OPERATOR:
+        accessible_station_ids = [s.id for s in db.query(Station).filter(Station.operator_id == user.id).all()]
+        query = query.filter(WorkOrder.station_id.in_(accessible_station_ids)) if accessible_station_ids else query.filter(WorkOrder.station_id == -1)
+    if station_id:
+        query = query.filter(WorkOrder.station_id == station_id)
+    if status:
+        query = query.filter(WorkOrder.status == status)
+    wos = query.all()
+    pile_ids = [w.pile_id for w in wos]
+    piles = {p.id: p for p in db.query(Pile).filter(Pile.id.in_(pile_ids)).all()} if pile_ids else {}
+    stations = {s.id: s for s in db.query(Station).all()}
+    data = []
+    for w in wos:
+        p = piles.get(w.pile_id)
+        st = stations.get(w.station_id)
+        data.append({
+            "id": w.id,
+            "order_no": w.order_no,
+            "pile_id": w.pile_id,
+            "pile_code": p.pile_code if p else "",
+            "station_id": w.station_id,
+            "station_name": st.name if st else "",
+            "fault_code": w.fault_code,
+            "fault_description": w.fault_description,
+            "status": w.status.value,
+            "handler_name": w.handler_name or "",
+            "result": w.result or "",
+            "resolved_at": w.resolved_at.isoformat() if w.resolved_at else None,
+            "created_at": w.created_at.isoformat() if w.created_at else None,
+            "updated_at": w.updated_at.isoformat() if w.updated_at else None,
+        })
+    return {"success": True, "data": data}
+
+
+@app.get("/api/work-orders/stats")
+def work_order_stats(
+    db: Session = Depends(get_sync_db),
+    user: Optional[User] = Depends(get_current_user)
+):
+    if not user or user.role not in (UserRole.ADMIN, UserRole.OPERATOR):
+        raise HTTPException(403, "无权查看")
+    query = db.query(WorkOrder)
+    if user.role == UserRole.OPERATOR:
+        accessible_station_ids = [s.id for s in db.query(Station).filter(Station.operator_id == user.id).all()]
+        query = query.filter(WorkOrder.station_id.in_(accessible_station_ids)) if accessible_station_ids else query.filter(WorkOrder.station_id == -1)
+    pending = query.filter(WorkOrder.status == WorkOrderStatus.PENDING).count()
+    processing = query.filter(WorkOrder.status == WorkOrderStatus.PROCESSING).count()
+    resolved = query.filter(WorkOrder.status == WorkOrderStatus.RESOLVED).count()
+    closed = query.filter(WorkOrder.status == WorkOrderStatus.CLOSED).count()
+    return {"success": True, "data": {
+        "pending": pending,
+        "processing": processing,
+        "resolved": resolved,
+        "closed": closed,
+        "total": pending + processing + resolved + closed
+    }}
+
+
+@app.post("/api/work-orders")
+def create_work_order(
+    req: CreateWorkOrderRequest,
+    db: Session = Depends(get_sync_db),
+    user: Optional[User] = Depends(get_current_user)
+):
+    if not user or user.role not in (UserRole.ADMIN, UserRole.OPERATOR):
+        raise HTTPException(403, "无权创建工单")
+    pile = db.query(Pile).filter(Pile.pile_code == req.pile_code).first()
+    if not pile:
+        raise HTTPException(404, "充电桩不存在")
+    if user.role == UserRole.OPERATOR:
+        station = db.query(Station).filter(Station.id == pile.station_id).first()
+        if not station or station.operator_id != user.id:
+            raise HTTPException(403, "无权为该桩创建工单")
+    now_wo = datetime.utcnow()
+    order_no = f"WO{now_wo.strftime('%Y%m%d%H%M%S')}{now_wo.microsecond // 1000:03d}{pile.id:04d}"
+    wo = WorkOrder(
+        order_no=order_no,
+        pile_id=pile.id,
+        station_id=pile.station_id,
+        fault_code=req.fault_code or pile.fault_code,
+        fault_description=req.fault_description,
+        status=WorkOrderStatus.PENDING,
+    )
+    db.add(wo)
+    db.commit()
+    db.refresh(wo)
+    return {"success": True, "data": {"id": wo.id, "order_no": wo.order_no}}
+
+
+@app.post("/api/work-orders/{wo_id}/handle")
+def handle_work_order(
+    wo_id: int,
+    req: HandleWorkOrderRequest,
+    db: Session = Depends(get_sync_db),
+    user: Optional[User] = Depends(get_current_user)
+):
+    if not user or user.role not in (UserRole.ADMIN, UserRole.OPERATOR):
+        raise HTTPException(403, "无权处理工单")
+    wo = db.query(WorkOrder).filter(WorkOrder.id == wo_id).first()
+    if not wo:
+        raise HTTPException(404, "工单不存在")
+    if user.role == UserRole.OPERATOR:
+        station = db.query(Station).filter(Station.id == wo.station_id).first()
+        if not station or station.operator_id != user.id:
+            raise HTTPException(403, "无权处理该工单")
+    wo.status = req.status
+    wo.handler_id = user.id
+    wo.handler_name = user.phone
+    wo.result = req.result
+    if req.status in (WorkOrderStatus.RESOLVED, WorkOrderStatus.CLOSED):
+        wo.resolved_at = datetime.utcnow()
+    db.commit()
+    return {"success": True, "data": {"id": wo.id, "status": wo.status.value}}
+
+
+@app.get("/api/revenue/analysis")
+def revenue_analysis(
+    period: str = Query("day", pattern="^(day|week|month|custom)$"),
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    group_by: str = Query("station", pattern="^(station|pile_type)$"),
+    station_id: Optional[int] = None,
+    db: Session = Depends(get_sync_db),
+    user: Optional[User] = Depends(get_current_user)
+):
+    if not user or user.role != UserRole.ADMIN:
+        raise HTTPException(403, "无权查看收入分析")
+    range_start, range_end = _get_time_range(period, start_date, end_date)
+    query = db.query(Order).filter(
+        Order.start_time >= range_start,
+        Order.start_time <= range_end,
+        Order.payment_status != PaymentStatus.CANCELLED,
+    )
+    if station_id:
+        subq = db.query(Pile.id).filter(Pile.station_id == station_id).subquery()
+        query = query.filter(Order.pile_id.in_(subq))
+    orders = query.all()
+    pile_ids = [o.pile_id for o in orders]
+    piles = {p.id: p for p in db.query(Pile).filter(Pile.id.in_(pile_ids)).all()} if pile_ids else {}
+    stations = {s.id: s for s in db.query(Station).all()}
+    groups: Dict[str, Dict] = {}
+    for o in orders:
+        p = piles.get(o.pile_id)
+        if not p:
+            continue
+        if group_by == "station":
+            key = str(p.station_id)
+            name = stations.get(p.station_id).name if stations.get(p.station_id) else "未知"
+        else:
+            key = p.pile_type.value
+            name = "快充" if p.pile_type == PileType.FAST else "慢充"
+        if key not in groups:
+            groups[key] = {
+                "key": key,
+                "name": name,
+                "orders": 0,
+                "energy_kwh": 0.0,
+                "revenue": 0.0,
+                "station_id": p.station_id if group_by == "station" else None,
+            }
+        groups[key]["orders"] += 1
+        groups[key]["energy_kwh"] += o.energy_kwh
+        groups[key]["revenue"] += o.total_fee
+    result = []
+    for g in groups.values():
+        avg_price = round(g["revenue"] / g["orders"], 2) if g["orders"] > 0 else 0
+        result.append({
+            **g,
+            "energy_kwh": round(g["energy_kwh"], 2),
+            "revenue": round(g["revenue"], 2),
+            "avg_price": avg_price,
+        })
+    result.sort(key=lambda x: x["revenue"], reverse=True)
+    total_orders = sum(g["orders"] for g in result)
+    total_energy = sum(g["energy_kwh"] for g in result)
+    total_revenue = sum(g["revenue"] for g in result)
+    avg_price_total = round(total_revenue / total_orders, 2) if total_orders > 0 else 0
+    return {"success": True, "data": {
+        "period": period,
+        "group_by": group_by,
+        "range_start": range_start.isoformat(),
+        "range_end": range_end.isoformat(),
+        "total_orders": total_orders,
+        "total_energy": round(total_energy, 2),
+        "total_revenue": round(total_revenue, 2),
+        "avg_price": avg_price_total,
+        "items": result,
+    }}
 
 
 @app.websocket("/ws")

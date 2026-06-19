@@ -62,10 +62,13 @@
             </div>
             <div class="text-xs text-gray-400 mt-1">故障 {{ dashboard.fault_count }} 台</div>
           </div>
-          <div class="bg-white rounded-xl p-5 shadow-sm">
-            <div class="text-sm text-gray-500 mb-1">利用率</div>
-            <div class="text-3xl font-bold text-blue-600">{{ dashboard.utilization }}%</div>
-            <div class="text-xs text-gray-400 mt-1">充电中 {{ dashboard.charging_count }} 台</div>
+          <div class="bg-white rounded-xl p-5 shadow-sm cursor-pointer hover:shadow-md transition"
+               @click="activeTab = 'fault'">
+            <div class="text-sm text-gray-500 mb-1">待处理工单</div>
+            <div class="text-3xl font-bold text-orange-600">{{ dashboard.work_order_stats?.pending || 0 }}</div>
+            <div class="text-xs text-gray-400 mt-1">
+              已解决 {{ dashboard.work_order_stats?.resolved || 0 }} 件
+            </div>
           </div>
         </div>
 
@@ -109,7 +112,8 @@
           </div>
           <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
             <div v-for="s in dashboard.fault_warning_stations" :key="s.id"
-                 class="bg-red-50 border border-red-200 rounded-lg p-3">
+                 @click="goToStationFaults(s)"
+                 class="bg-red-50 border border-red-200 rounded-lg p-3 cursor-pointer hover:bg-red-100 transition">
               <div class="flex items-start justify-between mb-1">
                 <span class="font-medium text-gray-800 text-sm truncate flex-1">{{ s.name }}</span>
                 <span class="text-xs bg-red-500 text-white px-2 py-0.5 rounded-full ml-2">
@@ -121,6 +125,12 @@
                   <div class="h-full bg-red-500 rounded-full" :style="{ width: s.fault_rate + '%' }"></div>
                 </div>
                 <span class="text-xs font-semibold text-red-600 w-12 text-right">{{ s.fault_rate }}%</span>
+              </div>
+              <div class="text-xs text-red-500 mt-2 flex items-center gap-1">
+                点击查看故障工单
+                <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+                </svg>
               </div>
             </div>
           </div>
@@ -292,6 +302,195 @@
         </div>
       </div>
 
+      <div v-if="activeTab === 'fault'" class="bg-white rounded-xl shadow-sm">
+        <div class="p-4 border-b border-gray-100 flex flex-wrap items-center gap-3">
+          <select v-model="woFilter.station_id" @change="loadWorkOrders"
+                  class="border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-500">
+            <option value="">全部站点</option>
+            <option v-for="s in stations" :key="s.id" :value="s.id">{{ s.name }}</option>
+          </select>
+          <select v-model="woFilter.status" @change="loadWorkOrders"
+                  class="border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-emerald-500">
+            <option value="">全部状态</option>
+            <option value="pending">待处理</option>
+            <option value="processing">处理中</option>
+            <option value="resolved">已解决</option>
+            <option value="closed">已关闭</option>
+          </select>
+          <div class="flex-1"></div>
+          <span class="text-sm text-gray-500">
+            共 {{ workOrders.length }} 条工单
+          </span>
+        </div>
+        <div class="overflow-x-auto">
+          <table class="w-full text-sm">
+            <thead>
+              <tr class="bg-gray-50 text-gray-600">
+                <th class="text-left px-4 py-3 font-medium">工单编号</th>
+                <th class="text-left px-4 py-3 font-medium">站点</th>
+                <th class="text-left px-4 py-3 font-medium">充电桩</th>
+                <th class="text-left px-4 py-3 font-medium">故障描述</th>
+                <th class="text-left px-4 py-3 font-medium">处理人</th>
+                <th class="text-left px-4 py-3 font-medium">创建时间</th>
+                <th class="text-center px-4 py-3 font-medium">状态</th>
+                <th class="text-right px-4 py-3 font-medium">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="wo in workOrders" :key="wo.id" class="border-t border-gray-100 hover:bg-gray-50">
+                <td class="px-4 py-3 font-mono text-xs text-gray-700">{{ wo.order_no }}</td>
+                <td class="px-4 py-3 text-gray-700">{{ wo.station_name }}</td>
+                <td class="px-4 py-3 text-gray-700">{{ wo.pile_code }}</td>
+                <td class="px-4 py-3 text-gray-600 max-w-xs truncate" :title="wo.fault_description">
+                  {{ wo.fault_code ? `[${wo.fault_code}] ` : '' }}{{ wo.fault_description || '设备故障' }}
+                </td>
+                <td class="px-4 py-3 text-gray-500 text-xs">{{ wo.handler_name || '-' }}</td>
+                <td class="px-4 py-3 text-gray-500 text-xs">{{ wo.created_at?.slice(0,16).replace('T',' ') }}</td>
+                <td class="px-4 py-3 text-center">
+                  <span class="text-xs px-2 py-1 rounded-full font-medium"
+                        :class="woStatusClass(wo.status)">
+                    {{ woStatusText(wo.status) }}
+                  </span>
+                </td>
+                <td class="px-4 py-3 text-right">
+                  <button v-if="wo.status === 'pending' || wo.status === 'processing'"
+                          @click="openHandleWo(wo)"
+                          class="text-xs text-emerald-600 hover:text-emerald-700 font-medium">
+                    处理
+                  </button>
+                  <span v-else class="text-xs text-gray-400">已完结</span>
+                </td>
+              </tr>
+              <tr v-if="!workOrders.length">
+                <td colspan="8" class="text-center py-12 text-gray-400">暂无工单数据</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div v-if="activeTab === 'revenue'" class="space-y-4">
+        <div class="bg-white rounded-xl p-4 shadow-sm flex flex-wrap items-center gap-3">
+          <div class="flex items-center gap-2">
+            <span class="text-sm text-gray-600">时间范围：</span>
+            <div class="flex rounded-lg overflow-hidden border border-gray-200">
+              <button v-for="p in revenuePeriods" :key="p.key" @click="revenuePeriod = p.key"
+                      class="px-4 py-1.5 text-sm transition"
+                      :class="revenuePeriod === p.key ? 'bg-emerald-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'">
+                {{ p.label }}
+              </button>
+            </div>
+          </div>
+          <div v-if="revenuePeriod === 'custom'" class="flex items-center gap-2">
+            <input v-model="revenueDateRange.start" type="date"
+                   class="border border-gray-200 rounded-lg px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-emerald-500"/>
+            <span class="text-gray-400 text-sm">至</span>
+            <input v-model="revenueDateRange.end" type="date"
+                   class="border border-gray-200 rounded-lg px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-emerald-500"/>
+            <button @click="loadRevenueAnalysis"
+                    class="bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-1.5 rounded-lg text-sm font-medium transition">
+              查询
+            </button>
+          </div>
+          <div class="flex items-center gap-2 ml-4">
+            <span class="text-sm text-gray-600">分组方式：</span>
+            <div class="flex rounded-lg overflow-hidden border border-gray-200">
+              <button @click="revenueGroupBy = 'station'"
+                      class="px-4 py-1.5 text-sm transition"
+                      :class="revenueGroupBy === 'station' ? 'bg-emerald-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'">
+                按站点
+              </button>
+              <button @click="revenueGroupBy = 'pile_type'"
+                      class="px-4 py-1.5 text-sm transition"
+                      :class="revenueGroupBy === 'pile_type' ? 'bg-emerald-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'">
+                按桩类型
+              </button>
+            </div>
+          </div>
+          <div class="flex-1"></div>
+          <div class="text-xs text-gray-400">
+            {{ revenueData.range_start?.slice(0,10) }} ~ {{ revenueData.range_end?.slice(0,16).replace('T',' ') }}
+          </div>
+        </div>
+
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+          <div class="bg-white rounded-xl p-5 shadow-sm">
+            <div class="text-sm text-gray-500 mb-1">订单总数</div>
+            <div class="text-3xl font-bold text-gray-800">{{ revenueData.total_orders }}</div>
+          </div>
+          <div class="bg-white rounded-xl p-5 shadow-sm">
+            <div class="text-sm text-gray-500 mb-1">充电量</div>
+            <div class="text-3xl font-bold text-blue-600">{{ revenueData.total_energy }} 度</div>
+          </div>
+          <div class="bg-white rounded-xl p-5 shadow-sm">
+            <div class="text-sm text-gray-500 mb-1">总收入</div>
+            <div class="text-3xl font-bold text-green-600">¥{{ revenueData.total_revenue }}</div>
+          </div>
+          <div class="bg-white rounded-xl p-5 shadow-sm">
+            <div class="text-sm text-gray-500 mb-1">客单价</div>
+            <div class="text-3xl font-bold text-amber-600">¥{{ revenueData.avg_price }}</div>
+          </div>
+        </div>
+
+        <div class="bg-white rounded-xl shadow-sm overflow-hidden">
+          <div class="px-5 py-3 border-b border-gray-100 flex items-center justify-between">
+            <h3 class="font-semibold text-gray-800">
+              {{ revenueGroupBy === 'station' ? '站点收入排行' : '桩类型收入分布' }}
+            </h3>
+            <span class="text-xs text-gray-400">共 {{ revenueData.items?.length || 0 }} 项</span>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead>
+                <tr class="bg-gray-50 text-gray-600">
+                  <th class="text-left px-4 py-3 font-medium">排名</th>
+                  <th class="text-left px-4 py-3 font-medium">
+                    {{ revenueGroupBy === 'station' ? '站点名称' : '桩类型' }}
+                  </th>
+                  <th class="text-right px-4 py-3 font-medium">订单数</th>
+                  <th class="text-right px-4 py-3 font-medium">充电量(度)</th>
+                  <th class="text-right px-4 py-3 font-medium">收入(元)</th>
+                  <th class="text-right px-4 py-3 font-medium">客单价</th>
+                  <th class="text-right px-4 py-3 font-medium">占比</th>
+                  <th class="text-center px-4 py-3 font-medium">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="(item, idx) in revenueData.items" :key="item.key" class="border-t border-gray-100 hover:bg-gray-50">
+                  <td class="px-4 py-3">
+                    <span class="w-6 h-6 rounded-full bg-gray-100 inline-flex items-center justify-center text-xs font-bold"
+                          :class="idx < 3 ? 'bg-amber-100 text-amber-700' : 'text-gray-500'">
+                      {{ idx + 1 }}
+                    </span>
+                  </td>
+                  <td class="px-4 py-3 text-gray-800 font-medium">{{ item.name }}</td>
+                  <td class="px-4 py-3 text-right">{{ item.orders }}</td>
+                  <td class="px-4 py-3 text-right text-blue-600">{{ item.energy_kwh }}</td>
+                  <td class="px-4 py-3 text-right text-green-600 font-bold">¥{{ item.revenue }}</td>
+                  <td class="px-4 py-3 text-right text-gray-500">¥{{ item.avg_price }}</td>
+                  <td class="px-4 py-3 text-right">
+                    <span class="text-xs text-gray-500">
+                      {{ revenueData.total_revenue > 0 ? ((item.revenue / revenueData.total_revenue) * 100).toFixed(1) : 0 }}%
+                    </span>
+                  </td>
+                  <td class="px-4 py-3 text-center">
+                    <button v-if="revenueGroupBy === 'station' && item.station_id"
+                            @click="openRevenueDetail(item)"
+                            class="text-xs text-emerald-600 hover:text-emerald-700 font-medium">
+                      查看明细
+                    </button>
+                    <span v-else class="text-xs text-gray-300">-</span>
+                  </td>
+                </tr>
+                <tr v-if="!revenueData.items?.length">
+                  <td colspan="8" class="text-center py-12 text-gray-400">暂无数据</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
       <div v-if="activeTab === 'orders'" class="bg-white rounded-xl shadow-sm">
         <div class="p-4 border-b border-gray-100 flex flex-wrap items-center gap-3">
           <input v-model="orderFilter.phone" placeholder="手机号"
@@ -394,6 +593,120 @@
       </div>
     </div>
 
+    <div v-if="showCreateWo" class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+      <div class="bg-white rounded-xl shadow-2xl p-6 w-full max-w-md">
+        <h3 class="text-lg font-bold mb-4 text-gray-800">创建派工单</h3>
+        <div class="space-y-3">
+          <div>
+            <label class="text-sm text-gray-600 block mb-1">充电桩编号</label>
+            <input v-model="createWoForm.pile_code" readonly
+                   class="w-full border border-gray-200 rounded-lg px-3 py-2 bg-gray-50 text-gray-500"/>
+          </div>
+          <div>
+            <label class="text-sm text-gray-600 block mb-1">故障码</label>
+            <input v-model="createWoForm.fault_code" placeholder="如：E101"
+                   class="w-full border border-gray-300 rounded-lg px-3 py-2 outline-none focus:ring-2 focus:ring-emerald-500"/>
+          </div>
+          <div>
+            <label class="text-sm text-gray-600 block mb-1">故障描述</label>
+            <textarea v-model="createWoForm.fault_description" rows="3" placeholder="请描述故障现象..."
+                      class="w-full border border-gray-300 rounded-lg px-3 py-2 outline-none focus:ring-2 focus:ring-emerald-500 resize-none"/>
+          </div>
+        </div>
+        <div class="flex gap-2 mt-5">
+          <button @click="submitCreateWo" class="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white py-2.5 rounded-lg font-medium transition">
+            创建工单
+          </button>
+          <button @click="showCreateWo = false" class="flex-1 bg-gray-100 hover:bg-gray-200 text-gray-700 py-2.5 rounded-lg transition">
+            取消
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="showHandleWo" class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+      <div class="bg-white rounded-xl shadow-2xl p-6 w-full max-w-md">
+        <h3 class="text-lg font-bold mb-4 text-gray-800">处理工单</h3>
+        <div class="space-y-3">
+          <div>
+            <label class="text-sm text-gray-600 block mb-1">处理结果</label>
+            <select v-model="handleWoForm.status" class="w-full border border-gray-300 rounded-lg px-3 py-2 outline-none focus:ring-2 focus:ring-emerald-500">
+              <option value="resolved">已解决</option>
+              <option value="processing">处理中</option>
+              <option value="closed">已关闭</option>
+            </select>
+          </div>
+          <div>
+            <label class="text-sm text-gray-600 block mb-1">处理说明</label>
+            <textarea v-model="handleWoForm.result" rows="4" placeholder="请描述处理过程和结果..."
+                      class="w-full border border-gray-300 rounded-lg px-3 py-2 outline-none focus:ring-2 focus:ring-emerald-500 resize-none"/>
+          </div>
+        </div>
+        <div class="flex gap-2 mt-5">
+          <button @click="submitHandleWo" class="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white py-2.5 rounded-lg font-medium transition">
+            提交处理
+          </button>
+          <button @click="showHandleWo = false" class="flex-1 bg-gray-100 hover:bg-gray-200 text-gray-700 py-2.5 rounded-lg transition">
+            取消
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="showRevenueDetail" class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+      <div class="bg-white rounded-xl shadow-2xl w-full max-w-3xl max-h-[80vh] flex flex-col">
+        <div class="p-5 border-b border-gray-100 flex items-center justify-between">
+          <div>
+            <h3 class="text-lg font-bold text-gray-800">{{ revenueDetailStation?.name }} - 订单明细</h3>
+            <p class="text-xs text-gray-500 mt-1">
+              共 {{ revenueDetailOrders.length }} 条订单
+            </p>
+          </div>
+          <button @click="showRevenueDetail = false" class="text-gray-400 hover:text-gray-600">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+            </svg>
+          </button>
+        </div>
+        <div class="flex-1 overflow-y-auto">
+          <table class="w-full text-sm">
+            <thead class="bg-gray-50 sticky top-0">
+              <tr class="text-gray-600">
+                <th class="text-left px-4 py-2 font-medium">订单号</th>
+                <th class="text-left px-4 py-2 font-medium">手机号</th>
+                <th class="text-left px-4 py-2 font-medium">充电桩</th>
+                <th class="text-left px-4 py-2 font-medium">时间</th>
+                <th class="text-right px-4 py-2 font-medium">电量</th>
+                <th class="text-right px-4 py-2 font-medium">费用</th>
+                <th class="text-center px-4 py-2 font-medium">状态</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="o in revenueDetailOrders" :key="o.id" class="border-t border-gray-50">
+                <td class="px-4 py-2 font-mono text-xs text-gray-700">{{ o.order_no }}</td>
+                <td class="px-4 py-2 text-gray-700">{{ o.user_phone }}</td>
+                <td class="px-4 py-2 text-gray-600">{{ o.pile_code }}</td>
+                <td class="px-4 py-2 text-gray-500 text-xs">{{ o.start_time?.slice(0,16).replace('T',' ') }}</td>
+                <td class="px-4 py-2 text-right">{{ o.energy_kwh }}度</td>
+                <td class="px-4 py-2 text-right text-green-600 font-medium">¥{{ o.total_fee }}</td>
+                <td class="px-4 py-2 text-center">
+                  <span class="text-xs px-2 py-0.5 rounded-full"
+                        :class="o.payment_status === 'paid' ? 'bg-green-100 text-green-700' :
+                                o.payment_status === 'pending' ? 'bg-yellow-100 text-yellow-700' :
+                                'bg-gray-100 text-gray-500'">
+                    {{ o.payment_status === 'paid' ? '已支付' : o.payment_status === 'pending' ? '待支付' : '已取消' }}
+                  </span>
+                </td>
+              </tr>
+              <tr v-if="!revenueDetailOrders.length">
+                <td colspan="7" class="text-center py-8 text-gray-400">暂无订单数据</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
     <div v-if="toastMessage" class="fixed top-20 left-1/2 -translate-x-1/2 z-50">
       <div class="bg-gray-800 text-white px-5 py-2.5 rounded-lg shadow-xl text-sm">
         {{ toastMessage }}
@@ -422,6 +735,8 @@ api.interceptors.request.use((config) => {
 
 const tabs = [
   { key: 'dashboard', label: '数据看板' },
+  { key: 'fault', label: '故障工单' },
+  { key: 'revenue', label: '收入分析' },
   { key: 'monitor', label: '站点监控' },
   { key: 'orders', label: '订单管理' },
 ]
@@ -430,6 +745,13 @@ const periods = [
   { key: 'day', label: '今日' },
   { key: 'week', label: '本周' },
   { key: 'month', label: '本月' },
+]
+
+const revenuePeriods = [
+  { key: 'day', label: '今日' },
+  { key: 'week', label: '本周' },
+  { key: 'month', label: '本月' },
+  { key: 'custom', label: '自定义' },
 ]
 
 const currentUser = ref<any>(null)
@@ -453,6 +775,20 @@ const newRule = ref({ period_name: '峰时', start_hour: 0, end_hour: 0, price_p
 const toastMessage = ref('')
 const trendChart = ref<HTMLElement | null>(null)
 const isExporting = ref(false)
+const workOrders = ref<any[]>([])
+const woFilter = ref({ station_id: '', status: '' })
+const showCreateWo = ref(false)
+const createWoForm = ref({ pile_code: '', fault_code: '', fault_description: '' })
+const showHandleWo = ref(false)
+const handleWoForm = ref({ result: '', status: 'resolved' })
+const selectedWoId = ref<number | null>(null)
+const revenuePeriod = ref('day')
+const revenueGroupBy = ref('station')
+const revenueDateRange = ref({ start: '', end: '' })
+const revenueData = ref<any>({ total_orders: 0, total_energy: 0, total_revenue: 0, avg_price: 0, items: [] })
+const showRevenueDetail = ref(false)
+const revenueDetailStation = ref<any>(null)
+const revenueDetailOrders = ref<any[]>([])
 
 let chart: any = null
 let ws: WebSocket | null = null
@@ -490,6 +826,21 @@ const filteredStations = computed(() => {
 
 watch(dashboardPeriod, () => {
   loadDashboard()
+})
+
+watch(activeTab, (tab) => {
+  if (tab === 'fault') loadWorkOrders()
+  if (tab === 'revenue') loadRevenueAnalysis()
+  if (tab === 'orders') loadOrders()
+  if (tab === 'dashboard') loadDashboard()
+})
+
+watch(revenuePeriod, () => {
+  loadRevenueAnalysis()
+})
+
+watch(revenueGroupBy, () => {
+  loadRevenueAnalysis()
 })
 
 const loadDashboard = async () => {
@@ -551,6 +902,11 @@ const selectStation = (s: any) => {
   selectedStation.value = s
 }
 
+const goToStationFaults = (s: any) => {
+  woFilter.value.station_id = String(s.id)
+  activeTab.value = 'fault'
+}
+
 const rebootPile = async (pile: any) => {
   if (!confirm(`确定要远程重启充电桩 ${pile.pile_code} 吗？`)) return
   try {
@@ -563,7 +919,7 @@ const rebootPile = async (pile: any) => {
 }
 
 const markDispatched = (pile: any) => {
-  showToast(`已对 ${pile.pile_code} 标记派工（模拟）`)
+  openCreateWo(pile)
 }
 
 const _downloadCsv = async (params: any, filename: string) => {
@@ -575,6 +931,15 @@ const _downloadCsv = async (params: any, filename: string) => {
     const resp = await axios.get(`${API_BASE}/api/orders/export`, {
       params, headers, responseType: 'blob',
     })
+    const contentType = resp.headers['content-type'] || ''
+    if (contentType.includes('application/json')) {
+      const text = await new Response(resp.data).text()
+      const json = JSON.parse(text)
+      if (json.empty) {
+        showToast(json.message || '该条件下没有可导出的订单')
+        return
+      }
+    }
     const url = window.URL.createObjectURL(new Blob([resp.data]))
     const a = document.createElement('a')
     a.href = url
@@ -585,7 +950,22 @@ const _downloadCsv = async (params: any, filename: string) => {
     window.URL.revokeObjectURL(url)
     showToast('导出成功')
   } catch (e: any) {
-    showToast(e.response?.data?.detail || '导出失败')
+    if (e.response?.data) {
+      try {
+        const reader = new FileReader()
+        reader.onload = () => {
+          try {
+            const json = JSON.parse(reader.result as string)
+            showToast(json.message || json.detail || '导出失败')
+          } catch {
+            showToast('导出失败')
+          }
+        }
+        reader.readAsText(e.response.data)
+        return
+      } catch {}
+    }
+    showToast(e.message || '导出失败')
   } finally {
     isExporting.value = false
   }
@@ -614,6 +994,104 @@ const submitRule = async () => {
     showToast('规则添加成功')
   } catch (e: any) {
     showToast(e.response?.data?.detail || '添加失败')
+  }
+}
+
+const loadWorkOrders = async () => {
+  try {
+    const params: any = {}
+    if (woFilter.value.station_id) params.station_id = woFilter.value.station_id
+    if (woFilter.value.status) params.status = woFilter.value.status
+    const r = await api.get('/api/work-orders', { params })
+    workOrders.value = r.data.data
+  } catch (e: any) {
+    showToast(e.response?.data?.detail || '加载失败')
+  }
+}
+
+const openCreateWo = (pile: any) => {
+  createWoForm.value = { pile_code: pile.pile_code, fault_code: pile.fault_code || '', fault_description: '' }
+  showCreateWo.value = true
+}
+
+const submitCreateWo = async () => {
+  try {
+    await api.post('/api/work-orders', createWoForm.value)
+    showCreateWo.value = false
+    createWoForm.value = { pile_code: '', fault_code: '', fault_description: '' }
+    await loadWorkOrders()
+    showToast('工单创建成功')
+  } catch (e: any) {
+    showToast(e.response?.data?.detail || '创建失败')
+  }
+}
+
+const openHandleWo = (wo: any) => {
+  selectedWoId.value = wo.id
+  handleWoForm.value = { result: '', status: 'resolved' }
+  showHandleWo.value = true
+}
+
+const submitHandleWo = async () => {
+  if (!selectedWoId.value) return
+  try {
+    await api.post(`/api/work-orders/${selectedWoId.value}/handle`, handleWoForm.value)
+    showHandleWo.value = false
+    selectedWoId.value = null
+    await loadWorkOrders()
+    await loadDashboard()
+    showToast('工单处理完成')
+  } catch (e: any) {
+    showToast(e.response?.data?.detail || '处理失败')
+  }
+}
+
+const woStatusText = (s: string) => ({
+  pending: '待处理', processing: '处理中', resolved: '已解决', closed: '已关闭'
+})[s] || s
+
+const woStatusClass = (s: string) => ({
+  'bg-yellow-100 text-yellow-700': s === 'pending',
+  'bg-blue-100 text-blue-700': s === 'processing',
+  'bg-green-100 text-green-700': s === 'resolved',
+  'bg-gray-100 text-gray-500': s === 'closed',
+})
+
+const loadRevenueAnalysis = async () => {
+  try {
+    const params: any = {
+      period: revenuePeriod.value,
+      group_by: revenueGroupBy.value,
+    }
+    if (revenuePeriod.value === 'custom') {
+      if (revenueDateRange.value.start) params.start_date = revenueDateRange.value.start + 'T00:00:00'
+      if (revenueDateRange.value.end) params.end_date = revenueDateRange.value.end + 'T23:59:59'
+    }
+    const r = await api.get('/api/revenue/analysis', { params })
+    revenueData.value = r.data.data
+  } catch (e: any) {
+    showToast(e.response?.data?.detail || '加载失败')
+  }
+}
+
+const openRevenueDetail = async (item: any) => {
+  if (!item.station_id) return
+  revenueDetailStation.value = item
+  try {
+    const params: any = { station_id: item.station_id }
+    if (revenuePeriod.value === 'custom') {
+      if (revenueDateRange.value.start) params.start_date = revenueDateRange.value.start + 'T00:00:00'
+      if (revenueDateRange.value.end) params.end_date = revenueDateRange.value.end + 'T23:59:59'
+    } else {
+      const rng = revenueData.value
+      if (rng.range_start) params.start_date = rng.range_start
+      if (rng.range_end) params.end_date = rng.range_end
+    }
+    const r = await api.get('/api/orders', { params })
+    revenueDetailOrders.value = r.data.data
+    showRevenueDetail.value = true
+  } catch (e: any) {
+    showToast(e.response?.data?.detail || '加载失败')
   }
 }
 
