@@ -2,16 +2,20 @@ import asyncio
 import json
 import os
 import time
-from datetime import datetime, timedelta
+import secrets
+import io
+import csv
+from datetime import datetime, timedelta, date
 from enum import Enum as PyEnum
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 import aiomqtt
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query, BackgroundTasks, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import (
-    Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Enum, Text, create_engine, func
+    Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Enum, Text, create_engine, func, and_
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
@@ -67,6 +71,7 @@ class User(Base):
     phone = Column(String(20), unique=True, index=True, nullable=False)
     password_hash = Column(String(255), default="")
     role = Column(Enum(UserRole), default=UserRole.OWNER)
+    token = Column(String(64), unique=True, index=True, default="")
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -101,6 +106,7 @@ class Order(Base):
     id = Column(Integer, primary_key=True, index=True)
     order_no = Column(String(50), unique=True, index=True)
     user_phone = Column(String(20), index=True, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     pile_id = Column(Integer, ForeignKey("piles.id"), nullable=False)
     start_time = Column(DateTime, nullable=True)
     end_time = Column(DateTime, nullable=True)
@@ -180,6 +186,28 @@ def get_sync_db():
         db.close()
 
 
+def _get_user_by_token_sync(token: str, db: Session) -> Optional[User]:
+    if not token:
+        return None
+    return db.query(User).filter(User.token == token).first()
+
+
+def get_current_user(authorization: Optional[str] = Header(None), x_token: Optional[str] = Header(None)) -> Optional[User]:
+    db = next(get_sync_db())
+    token = authorization.replace("Bearer ", "") if authorization else (x_token or "")
+    return _get_user_by_token_sync(token, db)
+
+
+def require_roles(*roles: UserRole):
+    def dependency(user: Optional[User] = Depends(get_current_user)) -> User:
+        if not user:
+            raise HTTPException(401, "未登录或登录已过期")
+        if user.role not in roles:
+            raise HTTPException(403, "权限不足")
+        return user
+    return dependency
+
+
 class StationCreate(BaseModel):
     name: str
     address: str
@@ -228,7 +256,7 @@ class LoginRequest(BaseModel):
     password: str = ""
 
 
-app = FastAPI(title="充电桩实时监控与扫码启停平台", version="1.0.0")
+app = FastAPI(title="充电桩实时监控与扫码启停平台", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -237,6 +265,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _generate_token() -> str:
+    return secrets.token_hex(32)
 
 
 @app.on_event("startup")
@@ -257,17 +289,17 @@ async def startup_event():
             db.commit()
         existing_users = db.query(User).count()
         if existing_users == 0:
-            db.add_all([
-                User(phone="13800000001", role=UserRole.ADMIN),
-                User(phone="13800000002", role=UserRole.OPERATOR),
-                User(phone="13800000003", role=UserRole.OWNER),
-            ])
+            admin = User(phone="13800000001", role=UserRole.ADMIN, token=_generate_token())
+            operator = User(phone="13800000002", role=UserRole.OPERATOR, token=_generate_token())
+            owner = User(phone="13800000003", role=UserRole.OWNER, token=_generate_token())
+            db.add_all([admin, operator, owner])
+            db.flush()
             if db.query(Station).count() == 0:
                 stations = [
                     Station(name="朝阳公园充电站", address="北京市朝阳区朝阳公园南门",
-                            latitude=39.937, longitude=116.475, pile_count=6),
+                            latitude=39.937, longitude=116.475, pile_count=6, operator_id=operator.id),
                     Station(name="中关村科技园站", address="北京市海淀区中关村大街1号",
-                            latitude=39.984, longitude=116.316, pile_count=8),
+                            latitude=39.984, longitude=116.316, pile_count=8, operator_id=operator.id),
                     Station(name="国贸CBD站", address="北京市朝阳区建国门外大街1号",
                             latitude=39.909, longitude=116.461, pile_count=10),
                 ]
@@ -328,14 +360,11 @@ async def handle_mqtt_message(topic: str, payload: Dict):
 
 
 async def update_pile_status(pile_code: str, payload: Dict):
+    from sqlalchemy import select
     async with async_session() as db:
-        pile = await db.get(Pile, None)
-        result = await db.execute(
-            __import__("sqlalchemy").select(Pile).where(Pile.pile_code == pile_code)
-        )
+        result = await db.execute(select(Pile).where(Pile.pile_code == pile_code))
         pile = result.scalar_one_or_none()
         if pile:
-            old_status = pile.status
             new_status = PileStatus(payload.get("status", pile.status.value))
             pile.status = new_status
             pile.fault_code = payload.get("fault_code", "")
@@ -360,10 +389,12 @@ async def update_pile_status(pile_code: str, payload: Dict):
 
 
 async def handle_charging_report(pile_code: str, payload: Dict):
+    from sqlalchemy import select
     async with async_session() as db:
+        subq = select(Pile.id).where(Pile.pile_code == pile_code).scalar_subquery()
         result = await db.execute(
-            __import__("sqlalchemy").select(Order).where(
-                Order.pile_id == __import__("sqlalchemy").select(Pile.id).where(Pile.pile_code == pile_code).scalar_subquery(),
+            select(Order).where(
+                Order.pile_id == subq,
                 Order.payment_status == PaymentStatus.PENDING,
                 Order.end_time.is_(None)
             ).order_by(Order.id.desc()).limit(1)
@@ -372,15 +403,19 @@ async def handle_charging_report(pile_code: str, payload: Dict):
         if order:
             order.energy_kwh = float(payload.get("energy_kwh", order.energy_kwh))
             now = datetime.utcnow()
-            duration_hours = (now - (order.start_time or now)).total_seconds() / 3600
-            order.energy_fee, order.service_fee, order.total_fee = billing_engine.calculate(
+            e_fee, s_fee, t_fee = billing_engine.calculate(
                 order.start_time or now, now, order.energy_kwh
             )
+            order.energy_fee = e_fee
+            order.service_fee = s_fee
+            order.total_fee = t_fee
             await db.commit()
             await broadcast_ws({
                 "type": "charging_progress",
                 "order_no": order.order_no,
-                "energy_kwh": order.energy_kwh,
+                "energy_kwh": round(order.energy_kwh, 2),
+                "energy_fee": round(order.energy_fee, 2),
+                "service_fee": round(order.service_fee, 2),
                 "total_fee": round(order.total_fee, 2),
             })
 
@@ -453,25 +488,17 @@ async def payment_timeout_loop():
         await asyncio.sleep(60)
 
 
-async def send_pile_command(pile_code: str, command: str, **kwargs) -> Dict:
-    import json as _json
-    event = asyncio.Event()
-    pending_commands[pile_code] = event
+async def send_pile_command_fire_and_forget(pile_code: str, command: str, **kwargs):
     try:
+        import json as _json
         async with aiomqtt.Client(MQTT_BROKER, port=MQTT_PORT) as client:
             await client.publish(
                 f"cmd/{pile_code}",
                 payload=_json.dumps({"command": command, **kwargs}),
                 qos=1
             )
-        try:
-            await asyncio.wait_for(event.wait(), timeout=10)
-            return command_results.pop(pile_code, {"result": "ok"})
-        except asyncio.TimeoutError:
-            return {"result": "timeout"}
-    finally:
-        pending_commands.pop(pile_code, None)
-        command_results.pop(pile_code, None)
+    except Exception as e:
+        print(f"[MQTT-CMD] {pile_code} {command} failed: {e}")
 
 
 @app.post("/api/auth/login")
@@ -479,17 +506,25 @@ def login(req: LoginRequest):
     db = next(get_sync_db())
     user = db.query(User).filter(User.phone == req.phone).first()
     if not user:
-        user = User(phone=req.phone, role=UserRole.OWNER)
+        user = User(phone=req.phone, role=UserRole.OWNER, token=_generate_token())
         db.add(user)
-        db.commit()
-        db.refresh(user)
-    return {"success": True, "data": {"id": user.id, "phone": user.phone, "role": user.role.value}}
+    else:
+        if not user.token:
+            user.token = _generate_token()
+    db.commit()
+    db.refresh(user)
+    return {"success": True, "data": {
+        "id": user.id, "phone": user.phone, "role": user.role.value, "token": user.token
+    }}
 
 
 @app.get("/api/stations")
-async def list_stations(db: AsyncSession = Depends(get_db)):
+async def list_stations(db: AsyncSession = Depends(get_db), user: Optional[User] = Depends(get_current_user)):
     from sqlalchemy import select
-    result = await db.execute(select(Station).order_by(Station.id))
+    query = select(Station).order_by(Station.id)
+    if user and user.role == UserRole.OPERATOR:
+        query = query.where(Station.operator_id == user.id)
+    result = await db.execute(query)
     stations = result.scalars().all()
     data = []
     for s in stations:
@@ -501,6 +536,7 @@ async def list_stations(db: AsyncSession = Depends(get_db)):
             "id": s.id, "name": s.name, "address": s.address,
             "latitude": s.latitude, "longitude": s.longitude,
             "pile_count": len(piles), "available": available, "fault": fault,
+            "operator_id": s.operator_id,
             "piles": [{
                 "id": p.id, "pile_code": p.pile_code,
                 "type": p.pile_type.value, "power": p.power,
@@ -511,16 +547,23 @@ async def list_stations(db: AsyncSession = Depends(get_db)):
 
 
 @app.get("/api/stations/{station_id}")
-async def get_station(station_id: int, db: AsyncSession = Depends(get_db)):
+async def get_station(
+    station_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user)
+):
     from sqlalchemy import select
     station = await db.get(Station, station_id)
     if not station:
         raise HTTPException(404, "站点不存在")
+    if user and user.role == UserRole.OPERATOR and station.operator_id != user.id:
+        raise HTTPException(403, "无权查看该站点")
     result = await db.execute(select(Pile).where(Pile.station_id == station_id))
     piles = result.scalars().all()
     return {"success": True, "data": {
         "id": station.id, "name": station.name, "address": station.address,
         "latitude": station.latitude, "longitude": station.longitude,
+        "operator_id": station.operator_id,
         "piles": [{
             "id": p.id, "pile_code": p.pile_code,
             "type": p.pile_type.value, "power": p.power,
@@ -547,8 +590,16 @@ async def get_pile(pile_code: str, db: AsyncSession = Depends(get_db)):
 
 
 @app.post("/api/charging/start")
-async def start_charging(req: StartChargingRequest, db: AsyncSession = Depends(get_db)):
+async def start_charging(
+    req: StartChargingRequest,
+    db: AsyncSession = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user)
+):
     from sqlalchemy import select
+    if not user:
+        raise HTTPException(401, "请先登录")
+    if user.phone != req.phone:
+        raise HTTPException(400, "只能使用自己的账号启动充电")
     result = await db.execute(select(Pile).where(Pile.pile_code == req.pile_code))
     pile = result.scalar_one_or_none()
     if not pile:
@@ -559,14 +610,13 @@ async def start_charging(req: StartChargingRequest, db: AsyncSession = Depends(g
         raise HTTPException(400, "该充电桩故障，无法使用")
     if pile.status == PileStatus.OFFLINE:
         raise HTTPException(400, "该充电桩离线，无法使用")
-    cmd_result = await send_pile_command(req.pile_code, "start", phone=req.phone)
-    if cmd_result.get("result") not in ("ok", "success"):
-        raise HTTPException(500, f"启动失败: {cmd_result}")
+    asyncio.create_task(send_pile_command_fire_and_forget(req.pile_code, "start", phone=req.phone))
     pile.status = PileStatus.CHARGING
     order_no = f"OD{datetime.utcnow().strftime('%Y%m%d%H%M%S')}{pile.id:04d}"
+    start_time = datetime.utcnow()
     order = Order(
-        order_no=order_no, user_phone=req.phone,
-        pile_id=pile.id, start_time=datetime.utcnow(),
+        order_no=order_no, user_phone=req.phone, user_id=user.id,
+        pile_id=pile.id, start_time=start_time,
         payment_status=PaymentStatus.PENDING,
     )
     db.add(order)
@@ -583,25 +633,45 @@ async def start_charging(req: StartChargingRequest, db: AsyncSession = Depends(g
         "station_id": pile.station_id,
         "status": PileStatus.CHARGING.value, "fault_code": "",
     })
-    return {"success": True, "data": {"order_no": order_no, "start_time": order.start_time.isoformat()}}
+    return {"success": True, "data": {"order_no": order_no, "start_time": start_time.isoformat()}}
 
 
 @app.post("/api/charging/stop")
-async def stop_charging(req: StopChargingRequest, db: AsyncSession = Depends(get_db)):
+async def stop_charging(
+    req: StopChargingRequest,
+    db: AsyncSession = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user)
+):
     from sqlalchemy import select
+    if not user:
+        raise HTTPException(401, "请先登录")
     result = await db.execute(select(Order).where(Order.order_no == req.order_no))
     order = result.scalar_one_or_none()
     if not order:
         raise HTTPException(404, "订单不存在")
+    if order.user_phone != user.phone and user.role == UserRole.OWNER:
+        raise HTTPException(403, "无权操作他人订单")
     if order.end_time:
-        return {"success": True, "data": {"order_no": order.order_no, "total_fee": round(order.total_fee, 2)}}
+        return {"success": True, "data": {
+            "order_no": order.order_no,
+            "energy_kwh": round(order.energy_kwh, 2),
+            "energy_fee": round(order.energy_fee, 2),
+            "service_fee": round(order.service_fee, 2),
+            "total_fee": round(order.total_fee, 2),
+            "start_time": order.start_time.isoformat() if order.start_time else None,
+            "end_time": order.end_time.isoformat() if order.end_time else None,
+            "payment_status": order.payment_status.value,
+        }}
     pile = await db.get(Pile, order.pile_id)
     if pile:
-        await send_pile_command(pile.pile_code, "stop")
-    end_time = datetime.utcnow()
-    energy = order.energy_kwh or max(0.5, (pile.power if pile else 7.0) * 0.2)
-    energy_fee, service_fee, total_fee = billing_engine.calculate(order.start_time or end_time, end_time, energy)
-    order.end_time = end_time
+        asyncio.create_task(send_pile_command_fire_and_forget(pile.pile_code, "stop"))
+    start_t = order.start_time or datetime.utcnow()
+    end_t = datetime.utcnow()
+    duration_hours = max(0.05, (end_t - start_t).total_seconds() / 3600.0)
+    power_kw = pile.power if pile else 7.0
+    energy = round(max(0.3, order.energy_kwh if order.energy_kwh > 0 else power_kw * duration_hours), 2)
+    energy_fee, service_fee, total_fee = billing_engine.calculate(start_t, end_t, energy)
+    order.end_time = end_t
     order.energy_kwh = energy
     order.energy_fee = energy_fee
     order.service_fee = service_fee
@@ -627,25 +697,37 @@ async def stop_charging(req: StopChargingRequest, db: AsyncSession = Depends(get
         "energy_fee": round(energy_fee, 2),
         "service_fee": round(service_fee, 2),
         "total_fee": round(total_fee, 2),
-        "start_time": order.start_time.isoformat() if order.start_time else None,
-        "end_time": end_time.isoformat(),
+        "start_time": start_t.isoformat(),
+        "end_time": end_t.isoformat(),
+        "payment_status": PaymentStatus.PENDING.value,
     }}
 
 
 @app.get("/api/orders/current")
-async def get_current_order(phone: str, pile_code: Optional[str] = None, db: AsyncSession = Depends(get_db)):
-    from sqlalchemy import select, and_
-    query = select(Order).where(
-        Order.user_phone == phone, Order.end_time.is_(None)
-    ).order_by(Order.id.desc()).limit(1)
-    result = await db.execute(query)
+async def get_current_order(
+    phone: str,
+    pile_code: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user)
+):
+    from sqlalchemy import select
+    if not user:
+        raise HTTPException(401, "请先登录")
+    if user.role == UserRole.OWNER and user.phone != phone:
+        raise HTTPException(403, "无权查看他人订单")
+    result = await db.execute(
+        select(Order).where(
+            Order.user_phone == phone, Order.end_time.is_(None)
+        ).order_by(Order.id.desc()).limit(1)
+    )
     order = result.scalar_one_or_none()
     if not order:
         return {"success": True, "data": None}
     pile = await db.get(Pile, order.pile_id)
-    duration = int((datetime.utcnow() - (order.start_time or datetime.utcnow())).total_seconds())
-    energy_fee, service_fee, total_fee = billing_engine.calculate(
-        order.start_time or datetime.utcnow(), datetime.utcnow(), order.energy_kwh
+    now = datetime.utcnow()
+    duration = int((now - (order.start_time or now)).total_seconds())
+    e_fee, s_fee, t_fee = billing_engine.calculate(
+        order.start_time or now, now, order.energy_kwh
     )
     return {"success": True, "data": {
         "order_no": order.order_no,
@@ -654,9 +736,9 @@ async def get_current_order(phone: str, pile_code: Optional[str] = None, db: Asy
         "start_time": order.start_time.isoformat() if order.start_time else None,
         "duration_seconds": duration,
         "energy_kwh": round(order.energy_kwh, 2),
-        "energy_fee": round(energy_fee, 2),
-        "service_fee": round(service_fee, 2),
-        "total_fee": round(total_fee, 2),
+        "energy_fee": round(e_fee, 2),
+        "service_fee": round(s_fee, 2),
+        "total_fee": round(t_fee, 2),
     }}
 
 
@@ -666,39 +748,60 @@ async def list_orders(
     station_id: Optional[int] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user)
 ):
-    from sqlalchemy import select, and_
-    query = select(Order).order_by(Order.id.desc()).limit(500)
+    from sqlalchemy import select
+    if not user:
+        raise HTTPException(401, "请先登录")
+    query = select(Order).order_by(Order.id.desc()).limit(1000)
     conditions = []
-    if phone:
+    if user.role == UserRole.OWNER:
+        conditions.append(Order.user_phone == user.phone)
+    elif phone:
         conditions.append(Order.user_phone == phone)
     if start_date:
-        conditions.append(Order.created_at >= datetime.fromisoformat(start_date))
+        try:
+            conditions.append(Order.created_at >= datetime.fromisoformat(start_date))
+        except ValueError:
+            pass
     if end_date:
-        conditions.append(Order.created_at <= datetime.fromisoformat(end_date))
+        try:
+            conditions.append(Order.created_at <= datetime.fromisoformat(end_date))
+        except ValueError:
+            pass
     if conditions:
         query = query.where(and_(*conditions))
     result = await db.execute(query)
     orders = result.scalars().all()
-    pile_ids = [o.pile_id for o in orders]
-    piles = {}
+    pile_ids = list({o.pile_id for o in orders})
+    piles: Dict[int, Pile] = {}
     if pile_ids:
-        from sqlalchemy import select as _s
-        pr = await db.execute(_s(Pile).where(Pile.id.in_(pile_ids)))
+        pr = await db.execute(select(Pile).where(Pile.id.in_(pile_ids)))
         for p in pr.scalars().all():
             piles[p.id] = p
     data = []
     for o in orders:
         p = piles.get(o.pile_id)
+        if station_id and p and p.station_id != station_id:
+            continue
+        if user.role == UserRole.OPERATOR:
+            if not p:
+                continue
+            st = await db.get(Station, p.station_id)
+            if not st or st.operator_id != user.id:
+                continue
         data.append({
             "id": o.id, "order_no": o.order_no,
             "user_phone": o.user_phone,
             "pile_code": p.pile_code if p else "",
+            "station_id": p.station_id if p else None,
             "pile_type": p.pile_type.value if p else "",
             "start_time": o.start_time.isoformat() if o.start_time else None,
             "end_time": o.end_time.isoformat() if o.end_time else None,
             "energy_kwh": round(o.energy_kwh, 2),
+            "energy_fee": round(o.energy_fee, 2),
+            "service_fee": round(o.service_fee, 2),
             "total_fee": round(o.total_fee, 2),
             "payment_status": o.payment_status.value,
             "paid_at": o.paid_at.isoformat() if o.paid_at else None,
@@ -706,34 +809,123 @@ async def list_orders(
     return {"success": True, "data": data}
 
 
-@app.post("/api/orders/{order_no}/pay")
-async def pay_order(order_no: str, db: AsyncSession = Depends(get_db)):
+@app.get("/api/orders/export")
+async def export_orders(
+    station_id: Optional[int] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user)
+):
+    if not user or user.role not in (UserRole.ADMIN, UserRole.OPERATOR):
+        raise HTTPException(403, "无权导出")
     from sqlalchemy import select
+    query = select(Order).order_by(Order.id.desc())
+    conditions = []
+    if start_date:
+        try:
+            conditions.append(Order.created_at >= datetime.fromisoformat(start_date))
+        except ValueError:
+            pass
+    if end_date:
+        try:
+            conditions.append(Order.created_at <= datetime.fromisoformat(end_date))
+        except ValueError:
+            pass
+    if conditions:
+        query = query.where(and_(*conditions))
+    result = await db.execute(query)
+    orders = result.scalars().all()
+    pile_ids = list({o.pile_id for o in orders})
+    piles: Dict[int, Pile] = {}
+    stations_map: Dict[int, Station] = {}
+    if pile_ids:
+        pr = await db.execute(select(Pile).where(Pile.id.in_(pile_ids)))
+        for p in pr.scalars().all():
+            piles[p.id] = p
+            if p.station_id not in stations_map:
+                stations_map[p.station_id] = await db.get(Station, p.station_id)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["订单号", "手机号", "站点名称", "桩编号", "桩类型",
+                     "开始时间", "结束时间", "电量(度)", "电费", "服务费", "总费用", "支付状态"])
+    status_text = {"paid": "已支付", "pending": "待支付", "cancelled": "已取消"}
+    type_text = {"fast": "快充", "slow": "慢充"}
+    for o in orders:
+        p = piles.get(o.pile_id)
+        st = stations_map.get(p.station_id) if p else None
+        if station_id and (not p or p.station_id != station_id):
+            continue
+        if user.role == UserRole.OPERATOR and (not st or st.operator_id != user.id):
+            continue
+        writer.writerow([
+            o.order_no,
+            o.user_phone,
+            st.name if st else "",
+            p.pile_code if p else "",
+            type_text.get(p.pile_type.value, "") if p else "",
+            o.start_time.strftime("%Y-%m-%d %H:%M") if o.start_time else "",
+            o.end_time.strftime("%Y-%m-%d %H:%M") if o.end_time else "",
+            round(o.energy_kwh, 2),
+            round(o.energy_fee, 2),
+            round(o.service_fee, 2),
+            round(o.total_fee, 2),
+            status_text.get(o.payment_status.value, o.payment_status.value),
+        ])
+    output.seek(0)
+    csv_content = "\ufeff" + output.getvalue()
+    filename = f"orders_{station_id or 'all'}_{datetime.now().strftime('%Y%m%d%H%M')}.csv"
+    headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
+    return StreamingResponse(iter([csv_content]), media_type="text/csv; charset=utf-8", headers=headers)
+
+
+@app.post("/api/orders/{order_no}/pay")
+async def pay_order(
+    order_no: str,
+    db: AsyncSession = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user)
+):
+    from sqlalchemy import select
+    if not user:
+        raise HTTPException(401, "请先登录")
     result = await db.execute(select(Order).where(Order.order_no == order_no))
     order = result.scalar_one_or_none()
     if not order:
         raise HTTPException(404, "订单不存在")
+    if user.role == UserRole.OWNER and order.user_phone != user.phone:
+        raise HTTPException(403, "无权支付他人订单")
     if order.payment_status == PaymentStatus.PAID:
-        return {"success": True, "data": {"order_no": order_no, "paid": True}}
+        return {"success": True, "data": {"order_no": order_no, "paid": True, "total_fee": round(order.total_fee, 2)}}
     if order.payment_status == PaymentStatus.CANCELLED:
-        raise HTTPException(400, "订单已取消")
+        raise HTTPException(400, "订单已取消，无法支付")
     order.payment_status = PaymentStatus.PAID
     order.paid_at = datetime.utcnow()
     await db.commit()
     return {"success": True, "data": {
-        "order_no": order_no, "total_fee": round(order.total_fee, 2),
+        "order_no": order_no,
+        "total_fee": round(order.total_fee, 2),
         "paid_at": order.paid_at.isoformat(),
     }}
 
 
 @app.post("/api/piles/command")
-async def pile_command(req: PileCommandRequest, db: AsyncSession = Depends(get_db)):
+async def pile_command(
+    req: PileCommandRequest,
+    db: AsyncSession = Depends(get_db),
+    user: Optional[User] = Depends(get_current_user)
+):
     from sqlalchemy import select
+    if not user or user.role not in (UserRole.ADMIN, UserRole.OPERATOR):
+        raise HTTPException(403, "无权操作充电桩")
     result = await db.execute(select(Pile).where(Pile.pile_code == req.pile_code))
     pile = result.scalar_one_or_none()
     if not pile:
         raise HTTPException(404, "充电桩不存在")
-    cmd_result = await send_pile_command(req.pile_code, req.command)
+    if user.role == UserRole.OPERATOR:
+        station = await db.get(Station, pile.station_id)
+        if not station or station.operator_id != user.id:
+            raise HTTPException(403, "无权操作该充电桩")
+    asyncio.create_task(send_pile_command_fire_and_forget(req.pile_code, req.command))
     if req.command == "reboot":
         pile.status = PileStatus.OFFLINE
         await db.commit()
@@ -748,48 +940,98 @@ async def pile_command(req: PileCommandRequest, db: AsyncSession = Depends(get_d
             "station_id": pile.station_id,
             "status": PileStatus.OFFLINE.value, "fault_code": "",
         })
-    return {"success": True, "data": cmd_result}
+    return {"success": True, "data": {"result": "sent"}}
+
+
+def _get_time_range(period: str) -> Tuple[datetime, datetime]:
+    now = datetime.utcnow()
+    today_start = datetime.combine(now.date(), datetime.min.time())
+    if period == "week":
+        week_start = today_start - timedelta(days=now.weekday())
+        return week_start, now
+    elif period == "month":
+        month_start = today_start.replace(day=1)
+        return month_start, now
+    return today_start, now
 
 
 @app.get("/api/admin/dashboard")
-def admin_dashboard(db: Session = Depends(get_sync_db)):
-    total_piles = db.query(Pile).count()
-    online = db.query(Pile).filter(Pile.status != PileStatus.OFFLINE).count()
-    charging = db.query(Pile).filter(Pile.status == PileStatus.CHARGING).count()
-    fault = db.query(Pile).filter(Pile.status == PileStatus.FAULT).count()
+def admin_dashboard(
+    period: str = Query("day", pattern="^(day|week|month)$"),
+    db: Session = Depends(get_sync_db),
+    user: Optional[User] = Depends(get_current_user)
+):
+    if not user or user.role not in (UserRole.ADMIN, UserRole.OPERATOR):
+        raise HTTPException(403, "无权访问")
+    range_start, range_end = _get_time_range(period)
+    pile_q = db.query(Pile)
+    station_q = db.query(Station)
+    if user.role == UserRole.OPERATOR:
+        station_q = station_q.filter(Station.operator_id == user.id)
+        accessible_station_ids = [s.id for s in station_q.all()]
+        pile_q = pile_q.filter(Pile.station_id.in_(accessible_station_ids)) if accessible_station_ids else pile_q.filter(Pile.station_id == -1)
+    total_piles = pile_q.count()
+    online = pile_q.filter(Pile.status != PileStatus.OFFLINE).count()
+    charging = pile_q.filter(Pile.status == PileStatus.CHARGING).count()
+    fault = pile_q.filter(Pile.status == PileStatus.FAULT).count()
     online_rate = round(online / total_piles * 100, 2) if total_piles > 0 else 0
     fault_rate = round(fault / total_piles * 100, 2) if total_piles > 0 else 0
     utilization = round(charging / online * 100, 2) if online > 0 else 0
 
-    stations = db.query(Station).all()
+    stations = station_q.all()
     station_stats = []
+    fault_stations = []
+    FAULT_WARN_THRESHOLD = 15
     for s in stations:
         piles = db.query(Pile).filter(Pile.station_id == s.id).all()
+        if not piles:
+            continue
         sc = sum(1 for p in piles if p.status == PileStatus.CHARGING)
-        station_stats.append({"id": s.id, "name": s.name, "utilization": round(sc / max(len(piles), 1) * 100, 2)})
+        fc = sum(1 for p in piles if p.status == PileStatus.FAULT)
+        util_pct = round(sc / len(piles) * 100, 2)
+        fault_pct = round(fc / len(piles) * 100, 2)
+        station_stats.append({"id": s.id, "name": s.name, "utilization": util_pct, "fault_rate": fault_pct, "fault_count": fc, "total": len(piles)})
+        if fault_pct >= FAULT_WARN_THRESHOLD or fc >= 2:
+            fault_stations.append({"id": s.id, "name": s.name, "fault_count": fc, "total": len(piles), "fault_rate": fault_pct})
     station_stats.sort(key=lambda x: x["utilization"], reverse=True)
+    fault_stations.sort(key=lambda x: x["fault_rate"], reverse=True)
 
-    today = datetime.utcnow().date()
-    hourly_data = []
-    for h in range(24):
-        start = datetime.combine(today, datetime.min.time()) + timedelta(hours=h)
-        end = start + timedelta(hours=1)
-        orders_hour = db.query(Order).filter(
-            Order.start_time >= start, Order.start_time < end
-        ).all()
-        energy = sum(o.energy_kwh for o in orders_hour)
-        revenue = sum(o.total_fee for o in orders_hour)
-        hourly_data.append({"hour": h, "energy_kwh": round(energy, 2), "revenue": round(revenue, 2)})
+    trend_data = []
+    orders_range = db.query(Order).filter(
+        Order.start_time >= range_start, Order.start_time <= range_end
+    ).all()
+    if period == "day":
+        for h in range(24):
+            start = range_start + timedelta(hours=h)
+            end = start + timedelta(hours=1)
+            bucket = [o for o in orders_range if o.start_time and start <= o.start_time < end]
+            energy = sum(o.energy_kwh for o in bucket)
+            revenue = sum(o.total_fee for o in bucket if o.payment_status != PaymentStatus.CANCELLED)
+            trend_data.append({"label": f"{h}时", "energy_kwh": round(energy, 2), "revenue": round(revenue, 2), "orders": len(bucket)})
+    elif period == "week":
+        for d in range(7):
+            start = range_start + timedelta(days=d)
+            end = start + timedelta(days=1)
+            bucket = [o for o in orders_range if o.start_time and start <= o.start_time < end]
+            energy = sum(o.energy_kwh for o in bucket)
+            revenue = sum(o.total_fee for o in bucket if o.payment_status != PaymentStatus.CANCELLED)
+            trend_data.append({"label": ["周一","周二","周三","周四","周五","周六","周日"][d], "energy_kwh": round(energy, 2), "revenue": round(revenue, 2), "orders": len(bucket)})
+    else:
+        num_days = (range_end - range_start).days + 1
+        for d in range(num_days):
+            start = range_start + timedelta(days=d)
+            end = start + timedelta(days=1)
+            bucket = [o for o in orders_range if o.start_time and start <= o.start_time < end]
+            energy = sum(o.energy_kwh for o in bucket)
+            revenue = sum(o.total_fee for o in bucket if o.payment_status != PaymentStatus.CANCELLED)
+            trend_data.append({"label": f"{d+1}日", "energy_kwh": round(energy, 2), "revenue": round(revenue, 2), "orders": len(bucket)})
 
-    total_today_orders = db.query(Order).filter(func.date(Order.created_at) == today).count()
-    total_today_energy = db.query(func.coalesce(func.sum(Order.energy_kwh), 0)).filter(
-        func.date(Order.start_time) == today
-    ).scalar() or 0
-    total_today_revenue = db.query(func.coalesce(func.sum(Order.total_fee), 0)).filter(
-        func.date(Order.paid_at) == today
-    ).scalar() or 0
+    total_orders = len(orders_range)
+    total_energy = sum(o.energy_kwh for o in orders_range)
+    total_revenue = sum(o.total_fee for o in orders_range if o.payment_status == PaymentStatus.PAID)
 
     return {"success": True, "data": {
+        "period": period,
         "total_piles": total_piles,
         "online_piles": online,
         "online_rate": online_rate,
@@ -798,15 +1040,23 @@ def admin_dashboard(db: Session = Depends(get_sync_db)):
         "charging_count": charging,
         "utilization": utilization,
         "top_utilization_stations": station_stats[:10],
-        "hourly_trend": hourly_data,
-        "today_orders": total_today_orders,
-        "today_energy": round(total_today_energy, 2),
-        "today_revenue": round(total_today_revenue, 2),
+        "fault_warning_stations": fault_stations,
+        "trend": trend_data,
+        "period_orders": total_orders,
+        "period_energy": round(total_energy, 2),
+        "period_revenue": round(total_revenue, 2),
+        "range_start": range_start.isoformat(),
+        "range_end": range_end.isoformat(),
     }}
 
 
 @app.get("/api/billing/rules")
-def list_billing_rules(db: Session = Depends(get_sync_db)):
+def list_billing_rules(
+    db: Session = Depends(get_sync_db),
+    user: Optional[User] = Depends(get_current_user)
+):
+    if not user or user.role != UserRole.ADMIN:
+        raise HTTPException(403, "无权查看计费规则")
     rules = db.query(BillingRule).filter(BillingRule.is_active == True).all()
     return {"success": True, "data": [
         {"id": r.id, "period_name": r.period_name,
@@ -816,7 +1066,13 @@ def list_billing_rules(db: Session = Depends(get_sync_db)):
 
 
 @app.post("/api/billing/rules")
-def create_billing_rule(rule: BillingRuleCreate, db: Session = Depends(get_sync_db)):
+def create_billing_rule(
+    rule: BillingRuleCreate,
+    db: Session = Depends(get_sync_db),
+    user: Optional[User] = Depends(get_current_user)
+):
+    if not user or user.role != UserRole.ADMIN:
+        raise HTTPException(403, "无权配置计费规则")
     new_rule = BillingRule(**rule.model_dump(), is_active=True)
     db.add(new_rule)
     db.commit()

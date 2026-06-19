@@ -29,6 +29,22 @@
 
     <div class="max-w-7xl mx-auto p-4">
       <div v-if="activeTab === 'dashboard'" class="space-y-4">
+        <div class="bg-white rounded-xl p-4 shadow-sm flex items-center justify-between flex-wrap gap-3">
+          <div class="flex items-center gap-2">
+            <span class="text-sm text-gray-600">时间范围：</span>
+            <div class="flex rounded-lg overflow-hidden border border-gray-200">
+              <button v-for="p in periods" :key="p.key" @click="dashboardPeriod = p.key"
+                      class="px-4 py-1.5 text-sm transition"
+                      :class="dashboardPeriod === p.key ? 'bg-emerald-600 text-white' : 'bg-white text-gray-600 hover:bg-gray-50'">
+                {{ p.label }}
+              </button>
+            </div>
+          </div>
+          <div class="text-xs text-gray-400">
+            {{ dashboard.range_start?.slice(0,10) }} ~ {{ dashboard.range_end?.slice(0,16).replace('T',' ') }}
+          </div>
+        </div>
+
         <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
           <div class="bg-white rounded-xl p-5 shadow-sm">
             <div class="text-sm text-gray-500 mb-1">充电桩总数</div>
@@ -55,26 +71,58 @@
 
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div class="md:col-span-1 bg-white rounded-xl p-5 shadow-sm">
-            <h3 class="font-semibold text-gray-800 mb-3">今日概览</h3>
+            <h3 class="font-semibold text-gray-800 mb-3">{{ periodLabel }}概览</h3>
             <div class="space-y-3">
               <div class="flex justify-between items-center py-2 border-b border-gray-50">
                 <span class="text-sm text-gray-600">充电订单</span>
-                <span class="font-semibold text-gray-800">{{ dashboard.today_orders }} 单</span>
+                <span class="font-semibold text-gray-800">{{ dashboard.period_orders }} 单</span>
               </div>
               <div class="flex justify-between items-center py-2 border-b border-gray-50">
                 <span class="text-sm text-gray-600">充电量</span>
-                <span class="font-semibold text-gray-800">{{ dashboard.today_energy }} 度</span>
+                <span class="font-semibold text-gray-800">{{ dashboard.period_energy }} 度</span>
               </div>
               <div class="flex justify-between items-center py-2">
                 <span class="text-sm text-gray-600">营收</span>
-                <span class="font-bold text-green-600 text-lg">¥{{ dashboard.today_revenue }}</span>
+                <span class="font-bold text-green-600 text-lg">¥{{ dashboard.period_revenue }}</span>
               </div>
             </div>
           </div>
 
           <div class="md:col-span-2 bg-white rounded-xl p-5 shadow-sm">
-            <h3 class="font-semibold text-gray-800 mb-3">24小时充电量趋势</h3>
+            <div class="flex items-center justify-between mb-3">
+              <h3 class="font-semibold text-gray-800">{{ periodLabel }}充电量&营收趋势</h3>
+              <span class="text-xs text-gray-400">单位：度 / 元</span>
+            </div>
             <div ref="trendChart" class="h-64"></div>
+          </div>
+        </div>
+
+        <div v-if="dashboard.fault_warning_stations?.length" class="bg-white rounded-xl p-5 shadow-sm border-l-4 border-red-500">
+          <div class="flex items-center gap-2 mb-3">
+            <svg class="w-5 h-5 text-red-500" fill="currentColor" viewBox="0 0 24 24">
+              <path d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"/>
+            </svg>
+            <h3 class="font-semibold text-gray-800">高故障率站点预警</h3>
+            <span class="text-xs text-red-500 bg-red-50 px-2 py-0.5 rounded">
+              共 {{ dashboard.fault_warning_stations.length }} 个站点需要关注
+            </span>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+            <div v-for="s in dashboard.fault_warning_stations" :key="s.id"
+                 class="bg-red-50 border border-red-200 rounded-lg p-3">
+              <div class="flex items-start justify-between mb-1">
+                <span class="font-medium text-gray-800 text-sm truncate flex-1">{{ s.name }}</span>
+                <span class="text-xs bg-red-500 text-white px-2 py-0.5 rounded-full ml-2">
+                  故障 {{ s.fault_count }}/{{ s.total }}
+                </span>
+              </div>
+              <div class="flex items-center gap-2 mt-2">
+                <div class="flex-1 bg-red-100 rounded-full h-2 overflow-hidden">
+                  <div class="h-full bg-red-500 rounded-full" :style="{ width: s.fault_rate + '%' }"></div>
+                </div>
+                <span class="text-xs font-semibold text-red-600 w-12 text-right">{{ s.fault_rate }}%</span>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -87,6 +135,7 @@
                 {{ idx + 1 }}
               </span>
               <span class="flex-1 text-sm text-gray-700 truncate">{{ s.name }}</span>
+              <span class="text-xs text-gray-400 w-24">故障 {{ s.fault_count || 0 }}</span>
               <div class="w-40 bg-gray-100 rounded-full h-2 overflow-hidden">
                 <div class="h-full bg-gradient-to-r from-green-400 to-emerald-500 rounded-full transition-all"
                      :style="{ width: s.utilization + '%' }"></div>
@@ -164,6 +213,9 @@
                 <span class="bg-gray-100 text-gray-600 px-2 py-0.5 rounded">共 {{ s.pile_count }}</span>
               </div>
             </div>
+            <div v-if="!filteredStations.length" class="p-6 text-center text-gray-400 text-sm">
+              暂无负责的站点
+            </div>
           </div>
         </div>
 
@@ -172,9 +224,10 @@
             <div class="bg-white rounded-xl p-5 shadow-sm">
               <h2 class="text-lg font-bold text-gray-800">{{ selectedStation.name }}</h2>
               <p class="text-sm text-gray-500 mt-1">{{ selectedStation.address }}</p>
-              <div class="flex gap-3 mt-4">
-                <button @click="exportStationOrders" class="text-sm bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 px-4 py-2 rounded-lg transition">
-                  导出订单CSV
+              <div class="flex gap-3 mt-4 flex-wrap">
+                <button @click="exportStationOrders" :disabled="isExporting"
+                        class="text-sm bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 px-4 py-2 rounded-lg transition disabled:opacity-50">
+                  {{ isExporting ? '导出中...' : '导出该站点订单CSV' }}
                 </button>
               </div>
             </div>
@@ -221,6 +274,9 @@
                   </div>
                 </div>
               </div>
+              <div v-if="!selectedStation.piles?.length" class="p-10 text-center text-gray-400 text-sm">
+                该站点暂无充电桩
+              </div>
             </div>
           </div>
 
@@ -248,8 +304,9 @@
           <button @click="loadOrders" class="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition">
             查询
           </button>
-          <button @click="exportOrdersCSV" class="bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 px-4 py-2 rounded-lg text-sm transition">
-            导出CSV
+          <button @click="exportAllOrders" :disabled="isExporting"
+                  class="bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 px-4 py-2 rounded-lg text-sm transition disabled:opacity-50">
+            {{ isExporting ? '导出中...' : '导出CSV' }}
           </button>
         </div>
         <div class="overflow-x-auto">
@@ -274,7 +331,10 @@
                 <td class="px-4 py-3 text-gray-600">{{ o.start_time?.slice(0,16).replace('T',' ') }}</td>
                 <td class="px-4 py-3 text-gray-600">{{ o.end_time?.slice(0,16).replace('T',' ') }}</td>
                 <td class="px-4 py-3 text-right font-medium">{{ o.energy_kwh }}</td>
-                <td class="px-4 py-3 text-right font-bold text-green-600">¥{{ o.total_fee }}</td>
+                <td class="px-4 py-3 text-right">
+                  <div class="text-green-600 font-bold">¥{{ o.total_fee }}</div>
+                  <div class="text-xs text-gray-400">电{{ o.energy_fee }}+服{{ o.service_fee }}</div>
+                </td>
                 <td class="px-4 py-3 text-center">
                   <span class="text-xs px-2 py-1 rounded-full"
                         :class="o.payment_status === 'paid' ? 'bg-green-100 text-green-700' :
@@ -343,7 +403,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import axios from 'axios'
 import * as echarts from 'echarts'
 
@@ -351,19 +411,36 @@ const emit = defineEmits(['goHome'])
 
 const API_BASE = 'http://localhost:8000'
 
+const api = axios.create({ baseURL: API_BASE })
+api.interceptors.request.use((config) => {
+  const user = JSON.parse(localStorage.getItem('cp_user') || 'null')
+  if (user?.token) {
+    config.headers['X-Token'] = user.token
+  }
+  return config
+})
+
 const tabs = [
   { key: 'dashboard', label: '数据看板' },
   { key: 'monitor', label: '站点监控' },
   { key: 'orders', label: '订单管理' },
 ]
 
+const periods = [
+  { key: 'day', label: '今日' },
+  { key: 'week', label: '本周' },
+  { key: 'month', label: '本月' },
+]
+
 const currentUser = ref<any>(null)
 const activeTab = ref('dashboard')
+const dashboardPeriod = ref('day')
 const dashboard = ref<any>({
   total_piles: 0, online_piles: 0, online_rate: 0,
   fault_count: 0, fault_rate: 0, charging_count: 0, utilization: 0,
-  top_utilization_stations: [], hourly_trend: [],
-  today_orders: 0, today_energy: 0, today_revenue: 0,
+  top_utilization_stations: [], fault_warning_stations: [],
+  trend: [], period_orders: 0, period_energy: 0, period_revenue: 0,
+  range_start: '', range_end: '',
 })
 const stations = ref<any[]>([])
 const selectedStation = ref<any>(null)
@@ -375,9 +452,12 @@ const showAddRule = ref(false)
 const newRule = ref({ period_name: '峰时', start_hour: 0, end_hour: 0, price_per_kwh: 0 })
 const toastMessage = ref('')
 const trendChart = ref<HTMLElement | null>(null)
+const isExporting = ref(false)
 
 let chart: any = null
 let ws: WebSocket | null = null
+
+const periodLabel = computed(() => periods.find(p => p.key === dashboardPeriod.value)?.label || '今日')
 
 const showToast = (msg: string) => {
   toastMessage.value = msg
@@ -408,26 +488,36 @@ const filteredStations = computed(() => {
   )
 })
 
+watch(dashboardPeriod, () => {
+  loadDashboard()
+})
+
 const loadDashboard = async () => {
   try {
-    const r = await axios.get(`${API_BASE}/api/admin/dashboard`)
+    const r = await api.get('/api/admin/dashboard', { params: { period: dashboardPeriod.value } })
     dashboard.value = r.data.data
     renderTrendChart()
-  } catch (e) {
-    console.error(e)
+  } catch (e: any) {
+    if (e.response?.status === 401 || e.response?.status === 403) {
+      showToast(e.response?.data?.detail || '无权限访问')
+      emit('goHome')
+    }
   }
 }
 
 const loadStations = async () => {
   try {
-    const r = await axios.get(`${API_BASE}/api/stations`)
+    const r = await api.get('/api/stations')
     stations.value = r.data.data
     if (selectedStation.value) {
       const updated = stations.value.find(s => s.id === selectedStation.value.id)
       if (updated) selectedStation.value = updated
     }
-  } catch (e) {
-    console.error(e)
+  } catch (e: any) {
+    if (e.response?.status === 401) {
+      currentUser.value = null
+      localStorage.removeItem('cp_user')
+    }
   }
 }
 
@@ -437,19 +527,23 @@ const loadOrders = async () => {
     if (orderFilter.value.phone) params.phone = orderFilter.value.phone
     if (orderFilter.value.start) params.start_date = orderFilter.value.start + 'T00:00:00'
     if (orderFilter.value.end) params.end_date = orderFilter.value.end + 'T23:59:59'
-    const r = await axios.get(`${API_BASE}/api/orders`, { params })
+    const r = await api.get('/api/orders', { params })
     orders.value = r.data.data
-  } catch (e) {
-    console.error(e)
+  } catch (e: any) {
+    if (e.response?.status === 401) {
+      currentUser.value = null
+      localStorage.removeItem('cp_user')
+    }
   }
 }
 
 const loadBillingRules = async () => {
+  if (currentUser.value?.role !== 'admin') return
   try {
-    const r = await axios.get(`${API_BASE}/api/billing/rules`)
+    const r = await api.get('/api/billing/rules')
     billingRules.value = r.data.data
-  } catch (e) {
-    console.error(e)
+  } catch (e: any) {
+    if (e.response?.status !== 403) console.error(e)
   }
 }
 
@@ -460,7 +554,7 @@ const selectStation = (s: any) => {
 const rebootPile = async (pile: any) => {
   if (!confirm(`确定要远程重启充电桩 ${pile.pile_code} 吗？`)) return
   try {
-    await axios.post(`${API_BASE}/api/piles/command`, { pile_code: pile.pile_code, command: 'reboot' })
+    await api.post('/api/piles/command', { pile_code: pile.pile_code, command: 'reboot' })
     showToast('重启指令已下发')
     await loadStations()
   } catch (e: any) {
@@ -472,55 +566,48 @@ const markDispatched = (pile: any) => {
   showToast(`已对 ${pile.pile_code} 标记派工（模拟）`)
 }
 
-const exportOrdersCSV = () => {
-  const headers = ['订单号', '手机号', '充电桩', '开始时间', '结束时间', '电量(度)', '费用', '状态']
-  const rows = orders.value.map(o => [
-    o.order_no, o.user_phone, o.pile_code,
-    o.start_time?.slice(0,16).replace('T',' ') || '',
-    o.end_time?.slice(0,16).replace('T',' ') || '',
-    o.energy_kwh, o.total_fee,
-    o.payment_status === 'paid' ? '已支付' : o.payment_status === 'pending' ? '待支付' : '已取消'
-  ])
-  const csv = '\uFEFF' + [headers, ...rows].map(r => r.join(',')).join('\n')
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
-  const a = document.createElement('a')
-  a.href = URL.createObjectURL(blob)
-  a.download = `orders_${Date.now()}.csv`
-  a.click()
-  showToast('导出成功')
+const _downloadCsv = async (params: any, filename: string) => {
+  isExporting.value = true
+  try {
+    const user = JSON.parse(localStorage.getItem('cp_user') || 'null')
+    const headers: any = {}
+    if (user?.token) headers['X-Token'] = user.token
+    const resp = await axios.get(`${API_BASE}/api/orders/export`, {
+      params, headers, responseType: 'blob',
+    })
+    const url = window.URL.createObjectURL(new Blob([resp.data]))
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    window.URL.revokeObjectURL(url)
+    showToast('导出成功')
+  } catch (e: any) {
+    showToast(e.response?.data?.detail || '导出失败')
+  } finally {
+    isExporting.value = false
+  }
 }
 
-const exportStationOrders = async () => {
+const exportAllOrders = () => {
+  const params: any = {}
+  if (orderFilter.value.start) params.start_date = orderFilter.value.start + 'T00:00:00'
+  if (orderFilter.value.end) params.end_date = orderFilter.value.end + 'T23:59:59'
+  const fname = `orders_${Date.now()}.csv`
+  _downloadCsv(params, fname)
+}
+
+const exportStationOrders = () => {
   if (!selectedStation.value) return
-  showToast('正在导出...')
-  try {
-    const r = await axios.get(`${API_BASE}/api/orders`)
-    const pileMap = new Map()
-    selectedStation.value.piles.forEach((p: any) => pileMap.set(p.id, p.pile_code))
-    const filtered = r.data.data.filter((o: any) => pileMap.has(o.pile_id))
-    const headers = ['订单号', '手机号', '充电桩', '开始时间', '结束时间', '电量(度)', '费用', '状态']
-    const rows = filtered.map((o: any) => [
-      o.order_no, o.user_phone, pileMap.get(o.pile_id) || '',
-      o.start_time?.slice(0,16).replace('T',' ') || '',
-      o.end_time?.slice(0,16).replace('T',' ') || '',
-      o.energy_kwh, o.total_fee,
-      o.payment_status === 'paid' ? '已支付' : o.payment_status === 'pending' ? '待支付' : '已取消'
-    ])
-    const csv = '\uFEFF' + [headers, ...rows].map(rr => rr.join(',')).join('\n')
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
-    const a = document.createElement('a')
-    a.href = URL.createObjectURL(blob)
-    a.download = `${selectedStation.value.name}_orders_${Date.now()}.csv`
-    a.click()
-    showToast('导出成功')
-  } catch (e) {
-    showToast('导出失败')
-  }
+  const fname = `${selectedStation.value.name}_orders_${Date.now()}.csv`
+  _downloadCsv({ station_id: selectedStation.value.id }, fname)
 }
 
 const submitRule = async () => {
   try {
-    await axios.post(`${API_BASE}/api/billing/rules`, newRule.value)
+    await api.post('/api/billing/rules', newRule.value)
     showAddRule.value = false
     newRule.value = { period_name: '峰时', start_hour: 0, end_hour: 0, price_per_kwh: 0 }
     await loadBillingRules()
@@ -533,12 +620,12 @@ const submitRule = async () => {
 const renderTrendChart = () => {
   if (!trendChart.value) return
   if (!chart) chart = echarts.init(trendChart.value)
-  const data = dashboard.value.hourly_trend || []
+  const data = dashboard.value.trend || []
   chart.setOption({
     tooltip: { trigger: 'axis' },
     legend: { data: ['充电量(度)', '营收(元)'], right: 0 },
-    grid: { left: 40, right: 40, top: 40, bottom: 30 },
-    xAxis: { type: 'category', data: data.map((d: any) => `${d.hour}时`), axisLabel: { fontSize: 11 } },
+    grid: { left: 40, right: 50, top: 40, bottom: 30 },
+    xAxis: { type: 'category', data: data.map((d: any) => d.label), axisLabel: { fontSize: 11 } },
     yAxis: [
       { type: 'value', name: '度', position: 'left' },
       { type: 'value', name: '元', position: 'right' },
@@ -581,6 +668,11 @@ const connectWS = () => {
 onMounted(() => {
   const saved = localStorage.getItem('cp_user')
   if (saved) currentUser.value = JSON.parse(saved)
+  if (!currentUser.value || currentUser.value.role === 'owner') {
+    showToast('请使用运维或管理员账号登录')
+    emit('goHome')
+    return
+  }
   loadDashboard()
   loadStations()
   loadOrders()

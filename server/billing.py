@@ -38,7 +38,7 @@ class BillingEngine:
             return hour >= start or hour < end
 
     def _get_price_for_hour(self, hour: int) -> float:
-        for p in self.periods:
+        for p in self.config.periods:
             if self._hour_in_period(hour, p):
                 return p.price_per_kwh
         return self.config.default_price

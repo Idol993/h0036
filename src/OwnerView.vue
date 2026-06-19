@@ -61,7 +61,7 @@
           </div>
         </div>
 
-        <div v-if="selectedStation" class="absolute bottom-3 left-3 right-3 lg:right-auto lg:w-96 bg-white rounded-xl shadow-2xl p-4 max-h-[50vh] overflow-y-auto">
+        <div v-if="selectedStation" class="absolute bottom-3 left-3 right-3 lg:right-auto lg:w-96 bg-white rounded-xl shadow-2xl p-4 max-h-[55vh] overflow-y-auto">
           <div class="flex items-start justify-between mb-3">
             <div>
               <h3 class="font-bold text-gray-800 text-lg">{{ selectedStation.name }}</h3>
@@ -71,7 +71,7 @@
           </div>
           <div class="flex gap-2 mb-3 text-xs">
             <span class="bg-green-100 text-green-700 px-2 py-1 rounded">空闲 {{ selectedStation.available }}</span>
-            <span class="bg-blue-100 text-blue-700 px-2 py-1 rounded">使用中 {{ selectedStation.pile_count - selectedStation.available - selectedStation.fault }}</span>
+            <span class="bg-blue-100 text-blue-700 px-2 py-1 rounded">使用中 {{ chargingCount }}</span>
             <span class="bg-red-100 text-red-700 px-2 py-1 rounded">故障 {{ selectedStation.fault }}</span>
           </div>
           <div class="space-y-2">
@@ -136,6 +136,7 @@
                 <h3 class="font-bold text-gray-800">正在充电</h3>
                 <span class="text-xs bg-green-600 text-white px-2 py-1 rounded animate-pulse">充电中</span>
               </div>
+              <div class="text-xs text-gray-400 mb-3 font-mono">{{ currentOrder.order_no }}</div>
               <div class="grid grid-cols-2 gap-4 mb-4">
                 <div>
                   <div class="text-xs text-gray-500 mb-1">桩编号</div>
@@ -169,7 +170,7 @@
                 </div>
               </div>
               <button @click="stopCharging()" class="w-full bg-red-500 hover:bg-red-600 text-white py-3 rounded-xl font-bold transition">
-                结束充电
+                结束充电并结算
               </button>
             </div>
             <div v-else class="text-center py-16 text-gray-400">
@@ -186,9 +187,13 @@
               <p>暂无充电记录</p>
             </div>
             <div v-else class="space-y-3">
-              <div v-for="order in orderHistory" :key="order.id" class="border rounded-xl p-4">
+              <div v-for="order in orderHistory" :key="order.id" class="border rounded-xl p-4"
+                   :class="order.payment_status === 'pending' && order.end_time ? 'border-yellow-300 bg-yellow-50/40' : ''">
                 <div class="flex items-center justify-between mb-2">
-                  <span class="font-medium text-gray-800">{{ order.pile_code || order.order_no }}</span>
+                  <div>
+                    <span class="font-medium text-gray-800">{{ order.pile_code || order.order_no }}</span>
+                    <span class="text-xs text-gray-400 ml-2 font-mono">{{ order.order_no }}</span>
+                  </div>
                   <span class="text-xs px-2 py-0.5 rounded"
                         :class="order.payment_status === 'paid' ? 'bg-green-100 text-green-700' :
                                 order.payment_status === 'pending' ? 'bg-yellow-100 text-yellow-700' :
@@ -196,15 +201,23 @@
                     {{ order.payment_status === 'paid' ? '已支付' : order.payment_status === 'pending' ? '待支付' : '已取消' }}
                   </span>
                 </div>
-                <div class="text-xs text-gray-500 mb-2">{{ order.start_time?.slice(0,16).replace('T',' ') }}</div>
-                <div class="flex items-center justify-between text-sm">
-                  <span class="text-gray-600">{{ order.energy_kwh }} 度</span>
-                  <span class="font-bold text-green-600">¥{{ order.total_fee }}</span>
+                <div class="text-xs text-gray-500 mb-2">
+                  {{ order.start_time?.slice(0,16).replace('T',' ') }}
+                  <span v-if="order.end_time"> → {{ order.end_time?.slice(0,16).replace('T',' ') }}</span>
+                </div>
+                <div class="grid grid-cols-3 gap-2 text-xs mb-2 text-gray-500">
+                  <div>电量: <span class="text-gray-800 font-medium">{{ order.energy_kwh }}度</span></div>
+                  <div>电费: ¥{{ order.energy_fee || 0 }}</div>
+                  <div>服务: ¥{{ order.service_fee || 0 }}</div>
+                </div>
+                <div class="flex items-center justify-between pt-2 border-t border-gray-100">
+                  <span class="text-sm text-gray-500">合计</span>
+                  <span class="font-bold text-green-600 text-lg">¥{{ order.total_fee }}</span>
                 </div>
                 <button v-if="order.payment_status === 'pending' && order.end_time"
                         @click="payOrder(order.order_no)"
-                        class="w-full mt-3 bg-green-600 hover:bg-green-700 text-white py-2 rounded-lg text-sm font-medium transition">
-                  去支付 ¥{{ order.total_fee }}
+                        class="w-full mt-3 bg-green-600 hover:bg-green-700 text-white py-2.5 rounded-lg text-sm font-medium transition">
+                  立即支付 ¥{{ order.total_fee }}
                 </button>
               </div>
             </div>
@@ -220,7 +233,7 @@
             <p class="text-gray-600 mb-4">扫描充电桩二维码启动充电</p>
             <div class="max-w-xs mx-auto">
               <div class="flex gap-2">
-                <input v-model="manualPileCode" placeholder="或手动输入桩编号"
+                <input v-model="manualPileCode" placeholder="或手动输入桩编号如 P0002"
                        class="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-green-500 focus:border-green-500 outline-none"/>
                 <button @click="scanStart" class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition">
                   启动
@@ -229,6 +242,50 @@
               <p class="text-xs text-gray-400 mt-2">提示：可直接在地图上点击充电桩的"扫码充电"</p>
             </div>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="settlementModal.show" class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+      <div class="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-md">
+        <div class="text-center mb-5">
+          <div class="w-16 h-16 mx-auto bg-green-100 rounded-full flex items-center justify-center mb-3">
+            <svg class="w-10 h-10 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+            </svg>
+          </div>
+          <h3 class="text-xl font-bold text-gray-800">充电已完成</h3>
+          <p class="text-sm text-gray-500 mt-1">{{ settlementModal.order_no }}</p>
+        </div>
+        <div class="bg-gray-50 rounded-xl p-4 mb-5 space-y-3">
+          <div class="flex justify-between text-sm">
+            <span class="text-gray-500">充电时长</span>
+            <span class="font-medium text-gray-800">{{ settlementModal.duration }}</span>
+          </div>
+          <div class="flex justify-between text-sm">
+            <span class="text-gray-500">充电电量</span>
+            <span class="font-medium text-gray-800">{{ settlementModal.energy_kwh }} 度</span>
+          </div>
+          <div class="flex justify-between text-sm">
+            <span class="text-gray-500">电费</span>
+            <span class="font-medium text-gray-800">¥{{ settlementModal.energy_fee }}</span>
+          </div>
+          <div class="flex justify-between text-sm">
+            <span class="text-gray-500">服务费</span>
+            <span class="font-medium text-gray-800">¥{{ settlementModal.service_fee }}</span>
+          </div>
+          <div class="flex justify-between items-center pt-3 border-t border-gray-200">
+            <span class="text-base font-semibold text-gray-800">应付金额</span>
+            <span class="font-bold text-2xl text-green-600">¥{{ settlementModal.total_fee }}</span>
+          </div>
+        </div>
+        <div class="flex gap-3">
+          <button @click="settlementModal.show = false" class="flex-1 bg-gray-100 hover:bg-gray-200 text-gray-700 py-3 rounded-xl font-medium transition">
+            稍后支付
+          </button>
+          <button @click="paySettlement" class="flex-1 bg-green-600 hover:bg-green-700 text-white py-3 rounded-xl font-bold transition">
+            立即支付
+          </button>
         </div>
       </div>
     </div>
@@ -248,6 +305,15 @@ import axios from 'axios'
 const emit = defineEmits(['goAdmin'])
 
 const API_BASE = 'http://localhost:8000'
+
+const api = axios.create({ baseURL: API_BASE })
+api.interceptors.request.use((config) => {
+  const user = JSON.parse(localStorage.getItem('cp_user') || 'null')
+  if (user?.token) {
+    config.headers['X-Token'] = user.token
+  }
+  return config
+})
 
 interface Pile {
   id: number
@@ -293,6 +359,15 @@ const orderHistory = ref<any[]>([])
 const manualPileCode = ref('')
 const toastMessage = ref('')
 const mapContainer = ref<HTMLElement | null>(null)
+const settlementModal = ref<{
+  show: boolean
+  order_no: string
+  duration: string
+  energy_kwh: number
+  energy_fee: number
+  service_fee: number
+  total_fee: number
+}>({ show: false, order_no: '', duration: '', energy_kwh: 0, energy_fee: 0, service_fee: 0, total_fee: 0 })
 
 let map: any = null
 let markers: any[] = []
@@ -304,14 +379,17 @@ const roleText = computed(() => {
   return r === 'admin' ? '管理员' : r === 'operator' ? '运维人员' : '车主'
 })
 
+const chargingCount = computed(() => {
+  if (!selectedStation.value) return 0
+  return selectedStation.value.piles.filter(p => p.status === 'charging').length
+})
+
 const showToast = (msg: string) => {
   toastMessage.value = msg
   setTimeout(() => { toastMessage.value = '' }, 2500)
 }
 
-const statusText = (s: string) => {
-  return { idle: '空闲', charging: '充电中', fault: '故障', offline: '离线' }[s] || s
-}
+const statusText = (s: string) => ({ idle: '空闲', charging: '充电中', fault: '故障', offline: '离线' }[s] || s)
 
 const pileBorderClass = (s: string) => ({
   'border-green-200 bg-green-50/30': s === 'idle',
@@ -337,11 +415,11 @@ const formatDuration = (sec: number) => {
 const doLogin = async () => {
   if (!loginPhone.value) return
   try {
-    const r = await axios.post(`${API_BASE}/api/auth/login`, { phone: loginPhone.value })
+    const r = await api.post('/api/auth/login', { phone: loginPhone.value })
     currentUser.value = r.data.data
-    showLogin.value = false
     localStorage.setItem('cp_user', JSON.stringify(r.data.data))
-    loadOrders()
+    showLogin.value = false
+    await loadOrders()
     showToast('登录成功')
   } catch (e: any) {
     showToast(e.response?.data?.detail || '登录失败')
@@ -350,11 +428,14 @@ const doLogin = async () => {
 
 const loadStations = async () => {
   try {
-    const r = await axios.get(`${API_BASE}/api/stations`)
+    const r = await api.get('/api/stations')
     stations.value = r.data.data
     renderMarkers()
-  } catch (e) {
-    console.error('loadStations', e)
+  } catch (e: any) {
+    if (e.response?.status === 401) {
+      currentUser.value = null
+      localStorage.removeItem('cp_user')
+    }
   }
 }
 
@@ -362,13 +443,16 @@ const loadOrders = async () => {
   if (!currentUser.value) return
   try {
     const [curr, hist] = await Promise.all([
-      axios.get(`${API_BASE}/api/orders/current`, { params: { phone: currentUser.value.phone } }),
-      axios.get(`${API_BASE}/api/orders`, { params: { phone: currentUser.value.phone } }),
+      api.get('/api/orders/current', { params: { phone: currentUser.value.phone } }),
+      api.get('/api/orders', { params: { phone: currentUser.value.phone } }),
     ])
     currentOrder.value = curr.data.data
     orderHistory.value = hist.data.data
-  } catch (e) {
-    console.error('loadOrders', e)
+  } catch (e: any) {
+    if (e.response?.status === 401) {
+      currentUser.value = null
+      localStorage.removeItem('cp_user')
+    }
   }
 }
 
@@ -380,7 +464,7 @@ const startCharging = async (pile: Pile) => {
   }
   try {
     showToast('正在启动充电...')
-    const r = await axios.post(`${API_BASE}/api/charging/start`, {
+    const r = await api.post('/api/charging/start', {
       phone: currentUser.value.phone, pile_code: pile.pile_code,
     })
     showToast('充电已启动')
@@ -395,30 +479,49 @@ const startCharging = async (pile: Pile) => {
 const stopCharging = async () => {
   if (!currentOrder.value) return
   try {
-    showToast('正在结束充电...')
-    const r = await axios.post(`${API_BASE}/api/charging/stop`, { order_no: currentOrder.value.order_no })
+    showToast('正在结算...')
+    const r = await api.post('/api/charging/stop', { order_no: currentOrder.value.order_no })
+    const data = r.data.data
+    let duration = ''
+    if (data.start_time && data.end_time) {
+      const sec = Math.floor((new Date(data.end_time).getTime() - new Date(data.start_time).getTime()) / 1000)
+      duration = formatDuration(sec)
+    }
+    settlementModal.value = {
+      show: true,
+      order_no: data.order_no,
+      duration,
+      energy_kwh: data.energy_kwh,
+      energy_fee: data.energy_fee,
+      service_fee: data.service_fee,
+      total_fee: data.total_fee,
+    }
     currentOrder.value = null
-    showToast(`充电完成，费用 ¥${r.data.data.total_fee}`)
-    activeTab.value = 'history'
     await loadOrders()
     await loadStations()
-    setTimeout(async () => {
-      const pending = orderHistory.value.find(o => o.payment_status === 'pending')
-      if (pending) {
-        if (confirm(`订单 ¥${pending.total_fee}，是否立即支付？`)) {
-          await payOrder(pending.order_no)
-        }
-      }
-    }, 500)
   } catch (e: any) {
-    showToast(e.response?.data?.detail || '操作失败')
+    showToast(e.response?.data?.detail || '结算失败')
   }
 }
 
 const payOrder = async (orderNo: string) => {
   try {
-    await axios.post(`${API_BASE}/api/orders/${orderNo}/pay`)
+    showToast('支付中...')
+    await api.post(`/api/orders/${orderNo}/pay`)
     showToast('支付成功')
+    await loadOrders()
+  } catch (e: any) {
+    showToast(e.response?.data?.detail || '支付失败')
+  }
+}
+
+const paySettlement = async () => {
+  if (!settlementModal.value.order_no) return
+  try {
+    await api.post(`/api/orders/${settlementModal.value.order_no}/pay`)
+    settlementModal.value.show = false
+    showToast('支付成功')
+    activeTab.value = 'history'
     await loadOrders()
   } catch (e: any) {
     showToast(e.response?.data?.detail || '支付失败')
@@ -432,7 +535,7 @@ const scanStart = async () => {
     return
   }
   try {
-    const pr = await axios.get(`${API_BASE}/api/piles/${manualPileCode.value}`)
+    const pr = await api.get(`/api/piles/${manualPileCode.value}`)
     const pile = pr.data.data
     if (pile.status !== 'idle') {
       showToast('该充电桩当前不可用')
@@ -445,7 +548,7 @@ const scanStart = async () => {
 }
 
 const renderMarkers = () => {
-  if (!map || !window.AMap) return
+  if (!map || !(window as any).AMap) return
   markers.forEach(m => m.setMap(null))
   markers = []
   stations.value.forEach(s => {
@@ -516,6 +619,8 @@ const connectWS = () => {
       } else if (data.type === 'charging_progress') {
         if (currentOrder.value && currentOrder.value.order_no === data.order_no) {
           currentOrder.value.energy_kwh = data.energy_kwh
+          currentOrder.value.energy_fee = data.energy_fee ?? currentOrder.value.energy_fee
+          currentOrder.value.service_fee = data.service_fee ?? currentOrder.value.service_fee
           currentOrder.value.total_fee = data.total_fee
         }
       }
