@@ -1259,6 +1259,62 @@ def work_order_stats(
     }}
 
 
+@app.get("/api/work-orders/efficiency")
+def work_order_efficiency(
+    period: str = Query("day", pattern="^(day|week|month)$"),
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    station_id: Optional[int] = None,
+    db: Session = Depends(get_sync_db),
+    user: Optional[User] = Depends(get_current_user)
+):
+    if not user or user.role not in (UserRole.ADMIN, UserRole.OPERATOR):
+        raise HTTPException(403, "无权访问")
+    range_start, range_end = _get_time_range(period, start_date, end_date)
+    query = db.query(WorkOrder)
+    if user.role == UserRole.OPERATOR:
+        stations = db.query(Station).filter(Station.operator_id == user.id).all()
+        station_ids = [s.id for s in stations]
+        query = query.filter(WorkOrder.station_id.in_(station_ids))
+    if station_id:
+        query = query.filter(WorkOrder.station_id == station_id)
+    wos_in_range = query.filter(
+        WorkOrder.created_at >= range_start,
+        WorkOrder.created_at <= range_end
+    ).all()
+    new_count = len(wos_in_range)
+    auto_closed = 0
+    manual_resolved = 0
+    processing_durations = []
+    for wo in wos_in_range:
+        if wo.status == WorkOrderStatus.RESOLVED:
+            if wo.result and ("自动关闭" in wo.result or "自动" in wo.result):
+                auto_closed += 1
+            else:
+                manual_resolved += 1
+            if wo.resolved_at and wo.created_at:
+                duration = abs((wo.resolved_at - wo.created_at).total_seconds())
+                processing_durations.append(duration)
+    avg_duration = round(sum(processing_durations) / len(processing_durations) / 60, 1) if processing_durations else 0
+    timeout_count = 0
+    now = datetime.utcnow()
+    timeout_threshold = timedelta(hours=24)
+    for wo in query.all():
+        if wo.status in (WorkOrderStatus.PENDING, WorkOrderStatus.PROCESSING):
+            if wo.created_at and (now - wo.created_at) > timeout_threshold:
+                timeout_count += 1
+    return {"success": True, "data": {
+        "period": period,
+        "range_start": range_start.isoformat(),
+        "range_end": range_end.isoformat(),
+        "new_count": new_count,
+        "auto_closed": auto_closed,
+        "manual_resolved": manual_resolved,
+        "avg_duration_minutes": avg_duration,
+        "timeout_count": timeout_count
+    }}
+
+
 @app.post("/api/work-orders")
 def create_work_order(
     req: CreateWorkOrderRequest,
@@ -1274,6 +1330,25 @@ def create_work_order(
         station = db.query(Station).filter(Station.id == pile.station_id).first()
         if not station or station.operator_id != user.id:
             raise HTTPException(403, "无权为该桩创建工单")
+    existing_wo = db.query(WorkOrder).filter(
+        WorkOrder.pile_id == pile.id,
+        WorkOrder.status.in_([WorkOrderStatus.PENDING, WorkOrderStatus.PROCESSING])
+    ).first()
+    if existing_wo:
+        return {
+            "success": False,
+            "duplicate": True,
+            "existing_wo": {
+                "id": existing_wo.id,
+                "order_no": existing_wo.order_no,
+                "status": existing_wo.status.value,
+                "fault_code": existing_wo.fault_code,
+                "fault_description": existing_wo.fault_description,
+                "handler_name": existing_wo.handler_name,
+                "created_at": existing_wo.created_at.isoformat() if existing_wo.created_at else None
+            },
+            "message": "该桩已有待处理工单"
+        }
     now_wo = datetime.utcnow()
     order_no = f"WO{now_wo.strftime('%Y%m%d%H%M%S')}{now_wo.microsecond // 1000:03d}{pile.id:04d}"
     wo = WorkOrder(

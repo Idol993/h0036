@@ -137,6 +137,44 @@
         </div>
 
         <div class="bg-white rounded-xl p-5 shadow-sm">
+          <div class="flex items-center justify-between mb-4">
+            <h3 class="font-semibold text-gray-800">运维效率统计</h3>
+            <div class="flex gap-1 bg-gray-100 rounded-lg p-0.5">
+              <button @click="dashboardPeriod = 'day'; loadDashboard()" :class="['px-3 py-1 text-xs rounded-md transition', dashboardPeriod === 'day' ? 'bg-white text-emerald-600 shadow-sm font-medium' : 'text-gray-500 hover:text-gray-700']">今日</button>
+              <button @click="dashboardPeriod = 'week'; loadDashboard()" :class="['px-3 py-1 text-xs rounded-md transition', dashboardPeriod === 'week' ? 'bg-white text-emerald-600 shadow-sm font-medium' : 'text-gray-500 hover:text-gray-700']">本周</button>
+              <button @click="dashboardPeriod = 'month'; loadDashboard()" :class="['px-3 py-1 text-xs rounded-md transition', dashboardPeriod === 'month' ? 'bg-white text-emerald-600 shadow-sm font-medium' : 'text-gray-500 hover:text-gray-700']">本月</button>
+            </div>
+          </div>
+          <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
+            <div class="bg-blue-50 rounded-lg p-4 cursor-pointer hover:bg-blue-100 transition" @click="jumpToEfficiency('new')">
+              <div class="text-xs text-blue-600 mb-1">新建工单</div>
+              <div class="text-2xl font-bold text-blue-700">{{ woEfficiency?.new_count || 0 }}</div>
+              <div class="text-xs text-blue-400 mt-1">点击查看</div>
+            </div>
+            <div class="bg-green-50 rounded-lg p-4 cursor-pointer hover:bg-green-100 transition" @click="jumpToEfficiency('auto')">
+              <div class="text-xs text-green-600 mb-1">自动关闭</div>
+              <div class="text-2xl font-bold text-green-700">{{ woEfficiency?.auto_closed || 0 }}</div>
+              <div class="text-xs text-green-400 mt-1">设备恢复</div>
+            </div>
+            <div class="bg-emerald-50 rounded-lg p-4 cursor-pointer hover:bg-emerald-100 transition" @click="jumpToEfficiency('manual')">
+              <div class="text-xs text-emerald-600 mb-1">人工解决</div>
+              <div class="text-2xl font-bold text-emerald-700">{{ woEfficiency?.manual_resolved || 0 }}</div>
+              <div class="text-xs text-emerald-400 mt-1">点击查看</div>
+            </div>
+            <div class="bg-purple-50 rounded-lg p-4 cursor-pointer hover:bg-purple-100 transition" @click="jumpToEfficiency('avg')">
+              <div class="text-xs text-purple-600 mb-1">平均处理</div>
+              <div class="text-2xl font-bold text-purple-700">{{ woEfficiency?.avg_duration_minutes || 0 }}<span class="text-sm font-normal ml-0.5">分</span></div>
+              <div class="text-xs text-purple-400 mt-1">处理时长</div>
+            </div>
+            <div class="bg-red-50 rounded-lg p-4 cursor-pointer hover:bg-red-100 transition" @click="jumpToEfficiency('timeout')">
+              <div class="text-xs text-red-600 mb-1">超时未处理</div>
+              <div class="text-2xl font-bold text-red-700">{{ woEfficiency?.timeout_count || 0 }}</div>
+              <div class="text-xs text-red-400 mt-1">超过24h</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="bg-white rounded-xl p-5 shadow-sm">
           <h3 class="font-semibold text-gray-800 mb-4">站点利用率 Top 10</h3>
           <div class="space-y-3">
             <div v-for="(s, idx) in dashboard.top_utilization_stations" :key="s.id" class="flex items-center gap-3">
@@ -653,6 +691,63 @@
       </div>
     </div>
 
+    <div v-if="showWoDetail" class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+      <div class="bg-white rounded-xl shadow-2xl p-6 w-full max-w-md">
+        <div class="flex items-start justify-between mb-4">
+          <h3 class="text-lg font-bold text-gray-800">工单详情</h3>
+          <button @click="showWoDetail = false" class="text-gray-400 hover:text-gray-600 text-xl leading-none">&times;</button>
+        </div>
+        <div class="space-y-3 text-sm">
+          <div class="flex justify-between py-2 border-b border-gray-100">
+            <span class="text-gray-500">工单编号</span>
+            <span class="font-mono font-medium text-gray-800">{{ activeWoDetail?.order_no }}</span>
+          </div>
+          <div class="flex justify-between py-2 border-b border-gray-100">
+            <span class="text-gray-500">状态</span>
+            <span :class="['px-2 py-0.5 rounded-full text-xs font-medium', woStatusClass(activeWoDetail?.status)]">
+              {{ woStatusText(activeWoDetail?.status) }}
+            </span>
+          </div>
+          <div class="flex justify-between py-2 border-b border-gray-100">
+            <span class="text-gray-500">故障码</span>
+            <span class="font-medium text-red-600">{{ activeWoDetail?.fault_code || '-' }}</span>
+          </div>
+          <div class="flex justify-between py-2 border-b border-gray-100">
+            <span class="text-gray-500">故障描述</span>
+            <span class="text-gray-800 text-right max-w-[60%]">{{ activeWoDetail?.fault_description || '-' }}</span>
+          </div>
+          <div class="flex justify-between py-2 border-b border-gray-100">
+            <span class="text-gray-500">处理人</span>
+            <span class="text-gray-800">{{ activeWoDetail?.handler_name || '未指派' }}</span>
+          </div>
+          <div class="flex justify-between py-2 border-b border-gray-100">
+            <span class="text-gray-500">处理结果</span>
+            <span class="text-gray-800 text-right max-w-[60%]">{{ activeWoDetail?.result || '-' }}</span>
+          </div>
+          <div class="flex justify-between py-2">
+            <span class="text-gray-500">创建时间</span>
+            <span class="text-gray-600">{{ activeWoDetail?.created_at ? new Date(activeWoDetail.created_at).toLocaleString('zh-CN') : '-' }}</span>
+          </div>
+        </div>
+        <div class="bg-yellow-50 border border-yellow-200 rounded-lg p-3 mt-4">
+          <p class="text-sm text-yellow-700">
+            <svg class="w-4 h-4 inline mr-1 -mt-0.5" fill="currentColor" viewBox="0 0 20 20">
+              <path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clip-rule="evenodd"/>
+            </svg>
+            该桩已有待处理工单，请勿重复创建
+          </p>
+        </div>
+        <div class="flex gap-2 mt-5">
+          <button @click="closeWoDetailAndJump" class="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white py-2.5 rounded-lg font-medium transition">
+            查看工单列表
+          </button>
+          <button @click="showWoDetail = false" class="flex-1 bg-gray-100 hover:bg-gray-200 text-gray-700 py-2.5 rounded-lg transition">
+            关闭
+          </button>
+        </div>
+      </div>
+    </div>
+
     <div v-if="showRevenueDetail" class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
       <div class="bg-white rounded-xl shadow-2xl w-full max-w-3xl max-h-[80vh] flex flex-col">
         <div class="p-5 border-b border-gray-100 flex items-center justify-between">
@@ -849,12 +944,37 @@ const loadDashboard = async () => {
     const r = await api.get('/api/admin/dashboard', { params: { period: dashboardPeriod.value } })
     dashboard.value = r.data.data
     renderTrendChart()
+    loadWoEfficiency()
   } catch (e: any) {
     if (e.response?.status === 401 || e.response?.status === 403) {
       showToast(e.response?.data?.detail || '无权限访问')
       emit('goHome')
     }
   }
+}
+
+const woEfficiency = ref<any>(null)
+const loadWoEfficiency = async () => {
+  try {
+    const r = await api.get('/api/work-orders/efficiency', { params: { period: dashboardPeriod.value } })
+    woEfficiency.value = r.data.data
+  } catch (e: any) {
+    // fail silently
+  }
+}
+
+const jumpToEfficiency = (type: string) => {
+  if (type === 'new') {
+    woFilter.value.status = ''
+  } else if (type === 'auto') {
+    woFilter.value.status = 'resolved'
+  } else if (type === 'manual') {
+    woFilter.value.status = 'resolved'
+  } else if (type === 'timeout') {
+    woFilter.value.status = ''
+  }
+  activeTab.value = 'fault'
+  loadWorkOrders()
 }
 
 const loadStations = async () => {
@@ -1017,7 +1137,12 @@ const openCreateWo = (pile: any) => {
 
 const submitCreateWo = async () => {
   try {
-    await api.post('/api/work-orders', createWoForm.value)
+    const r = await api.post('/api/work-orders', createWoForm.value)
+    if (r.data.duplicate) {
+      showCreateWo.value = false
+      openWoDetail(r.data.existing_wo)
+      return
+    }
     showCreateWo.value = false
     createWoForm.value = { pile_code: '', fault_code: '', fault_description: '' }
     await loadWorkOrders()
@@ -1026,6 +1151,25 @@ const submitCreateWo = async () => {
   } catch (e: any) {
     showToast(e.response?.data?.detail || '创建失败')
   }
+}
+
+const showWoDetail = ref(false)
+const activeWoDetail = ref<any>(null)
+
+const openWoDetail = (wo: any) => {
+  activeWoDetail.value = wo
+  showWoDetail.value = true
+}
+
+const closeWoDetailAndJump = () => {
+  showWoDetail.value = false
+  if (activeWoDetail.value) {
+    woFilter.value.station_id = String(activeWoDetail.value.station_id || '')
+    woFilter.value.status = activeWoDetail.value.status
+    activeTab.value = 'fault'
+    loadWorkOrders()
+  }
+  activeWoDetail.value = null
 }
 
 const openHandleWo = (wo: any) => {
